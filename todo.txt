@@ -1,0 +1,28 @@
+GOAL:
+    Read ethereum block chain with SQL
+        make blocks table
+        make transactions table
+        make addresses table
+
+    Finish reading in blocks.json file and printing out single lines for now
+
+    Look at blackhole_fdw.c for stubs to add to code
+    Look at postgresql_fdw.c for tips on how to connect to networked databases
+    Look at file_fdw.c for examples of how to structure program
+
+
+    Issue with totalDifficulty column - INT8 (largest not including NUMERIC) doesn't fit the number
+        Need a way of converting number in blocks.json totalDifficulty attribute to a NUMERIC type, 
+        then all NumericGetDatum(n);
+
+        What is Numeric vs NumericVar?
+
+        https://www.postgresql.org/docs/current/ecpg-pgtypes.html#ECPG-PGTYPES-NUMERIC
+
+    Add options for fdw
+        Number of blocks to query from or send request to infura to download newest blocks
+        Look at blackhole_fdw.c for tips on options validator
+
+    Query ethereum/infura directly instead of writing to disk first
+        Check postgresql_fdw to see how network requests are sent and data retrieved
+            connection.c/h

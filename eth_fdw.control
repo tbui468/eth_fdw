@@ -1,0 +1,4 @@
+comment = 'ETH FDW'
+default_version = '1.0'
+module_pathname = '$libdir/eth_fdw'
+relocatable = true
