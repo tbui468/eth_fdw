@@ -1,2 +1,4 @@
-/py_scripts
 /todo.txt
+/eth_fdw.bc
+/eth_fdw.o
+/eth_fdw.so
