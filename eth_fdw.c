@@ -14,6 +14,7 @@
 #include "nodes/pg_list.h"
 
 #include "curl/curl.h"
+#include <threads.h>
 
 
 Datum edw_handler(PG_FUNCTION_ARGS);
@@ -44,14 +45,22 @@ enum edw_type {
     EDWT_OBJ
 };
 
+
+struct edw_response {
+    char* buf;
+    size_t size;
+    int cur;
+};
+
 struct edw_state {
     char* key_buf;
     size_t key_len;
     char* buf;
     size_t len;
     int cur;
-    CURL *curl;
     int count;
+
+    struct edw_response bufs[4];
 };
 
 struct edw_string {
@@ -86,15 +95,15 @@ struct edw_object {
     int count;
 };
 
-void edw_skip_whitespace(struct edw_state *state);
+void edw_skip_whitespace(struct edw_response *res);
 bool edw_is_digit(char c);
-void edw_next_char(struct edw_state *state);
-char edw_peek_char(struct edw_state *state);
-uint64_t edw_parse_integer(struct edw_state *state);
-struct edw_string edw_parse_string(struct edw_state *state);
-struct edw_list *edw_parse_list(struct edw_state *state);
-struct edw_value edw_parse_value(struct edw_state *state);
-struct edw_object *edw_parse_object(struct edw_state *state);
+void edw_next_char(struct edw_response *res);
+char edw_peek_char(struct edw_response *res);
+uint64_t edw_parse_integer(struct edw_response *res);
+struct edw_string edw_parse_string(struct edw_response *res);
+struct edw_list *edw_parse_list(struct edw_response *res);
+struct edw_value edw_parse_value(struct edw_response *res);
+struct edw_object *edw_parse_object(struct edw_response *res);
 
 struct edw_object *edw_object_init(void);
 void edw_object_free(struct edw_object* o);
@@ -107,6 +116,7 @@ void edw_list_append_value(struct edw_list *l, struct edw_value v);
 void edw_insert_value(TupleTableSlot *slot, int idx, struct edw_object *obj, const char* attr, enum edw_type type);
 
 size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata);
+int thrd_request(void* args);
 
 Datum edw_handler(PG_FUNCTION_ARGS) {
     FdwRoutine *fdwroutine = makeNode(FdwRoutine);
@@ -262,23 +272,18 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
 
     fclose(f);
 
-    state->curl = curl_easy_init();
-    if (!state->curl) {
-        ereport(ERROR,
-                errcode(ERRCODE_FDW_ERROR),
-                errmsg("curl failed"));
-    }
+    curl_global_init(CURL_GLOBAL_ALL);
 
     state->count = 0;
 
     node->fdw_state = state;
 }
 
-void edw_skip_whitespace(struct edw_state *state) {
-    char c = state->buf[state->cur];
-    while (state->cur < state->len && (c == ' ' || c == '\n' || c == '\t')) {
-        state->cur++;
-        c = state->buf[state->cur];
+void edw_skip_whitespace(struct edw_response *res) {
+    char c = res->buf[res->cur];
+    while (res->cur < res->size && (c == ' ' || c == '\n' || c == '\t')) {
+        res->cur++;
+        c = res->buf[res->cur];
     }
 }
 
@@ -286,21 +291,21 @@ bool edw_is_digit(char c) {
     return '0' <= c && c <= '9'; 
 }
 
-void edw_next_char(struct edw_state *state) {
-    edw_skip_whitespace(state);
-    state->cur++;
+void edw_next_char(struct edw_response *res) {
+    edw_skip_whitespace(res);
+    res->cur++;
 }
 
-char edw_peek_char(struct edw_state *state) {
-    edw_skip_whitespace(state);
-    return state->buf[state->cur];
+char edw_peek_char(struct edw_response *res) {
+    edw_skip_whitespace(res);
+    return res->buf[res->cur];
 }
 
-uint64_t edw_parse_integer(struct edw_state *state) {
-    char* start = &state->buf[state->cur];
+uint64_t edw_parse_integer(struct edw_response *res) {
+    char* start = &res->buf[res->cur];
 
-    while (edw_is_digit(edw_peek_char(state))) {
-        edw_next_char(state);
+    while (edw_is_digit(edw_peek_char(res))) {
+        edw_next_char(res);
     }
 
     uint64_t final;
@@ -309,87 +314,89 @@ uint64_t edw_parse_integer(struct edw_state *state) {
     return final;
 }
 
-struct edw_string edw_parse_string(struct edw_state *state) {
-    edw_next_char(state); //"
-
+struct edw_string edw_parse_string(struct edw_response *res) {
     struct edw_string s;
-    s.start = &state->buf[state->cur];
+    edw_next_char(res); //"
+
+    s.start = &res->buf[res->cur];
     s.len = 0;
 
-    while (edw_peek_char(state) != '"') {
+    while (edw_peek_char(res) != '"') {
         s.len++;
-        edw_next_char(state);
+        edw_next_char(res);
     }
 
-    edw_next_char(state); //"
+    edw_next_char(res); //"
 
     return s;
 }
 
-struct edw_list *edw_parse_list(struct edw_state *state) {
-    edw_next_char(state); //[
+struct edw_list *edw_parse_list(struct edw_response *res) {
+    struct edw_list *l;
+    edw_next_char(res); //[
 
-    struct edw_list *l = edw_list_init();
+    l = edw_list_init();
 
-    while (edw_peek_char(state) != ']') {
-        edw_list_append_value(l, edw_parse_value(state));
+    while (edw_peek_char(res) != ']') {
+        edw_list_append_value(l, edw_parse_value(res));
 
         
-        if (edw_peek_char(state) == ',') {
-            edw_next_char(state);
+        if (edw_peek_char(res) == ',') {
+            edw_next_char(res);
         }
     }
 
-    edw_next_char(state); //]
+    edw_next_char(res); //]
 
     return l;
 }
 
-struct edw_value edw_parse_value(struct edw_state *state) {
+struct edw_value edw_parse_value(struct edw_response *res) {
     struct edw_value v;
 
-    switch (edw_peek_char(state)) {
+    switch (edw_peek_char(res)) {
         case '[':
             v.type = EDWT_LIST;
-            v.as.list = edw_parse_list(state);
+            v.as.list = edw_parse_list(res);
             break;
         case '"':
             v.type = EDWT_STR;
-            v.as.string = edw_parse_string(state);
+            v.as.string = edw_parse_string(res);
             break;
         case '{':
             v.type = EDWT_OBJ;
-            v.as.object = edw_parse_object(state);
+            v.as.object = edw_parse_object(res);
             break;
         default:
             v.type = EDWT_INT;
-            v.as.integer = edw_parse_integer(state);
+            v.as.integer = edw_parse_integer(res);
             break;
     }
 
     return v;
 }
 
-struct edw_object *edw_parse_object(struct edw_state *state) {
-    edw_next_char(state); //{
+struct edw_object *edw_parse_object(struct edw_response *res) {
+    struct edw_object *obj;
+    struct edw_entry e;
+    edw_next_char(res); //{
 
-    struct edw_object* obj = edw_object_init();
+    obj = edw_object_init();
 
-    while (edw_peek_char(state) != '}') {
-        struct edw_entry e;
+    while (edw_peek_char(res) != '}') {
 
-        e.key = edw_parse_string(state); //key
-        edw_next_char(state); //:
-        e.value = edw_parse_value(state);
+        e.key = edw_parse_string(res); //key
+        edw_next_char(res); //:
+        e.value = edw_parse_value(res);
 
         edw_object_append_entry(obj, e);
 
-        if (edw_peek_char(state) == ',') {
-            edw_next_char(state);
+        if (edw_peek_char(res) == ',') {
+            edw_next_char(res);
         }
     }
 
-    edw_next_char(state); //}
+    edw_next_char(res); //}
 
     return obj;
 }
@@ -467,17 +474,15 @@ void edw_insert_value(TupleTableSlot *slot, int idx, struct edw_object *obj, con
     }
 }
 
-
-struct MyData {
-    char* buf;
-    size_t size;
-};
-
 size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata) {
-    size_t realsize = size * nmemb;
-    struct MyData *d = (struct MyData*)userdata;
+    size_t realsize;
+    struct edw_response *d;
+    char *buf;
 
-    char* buf = realloc(d->buf, d->size + realsize + 1); //why does using repalloc cause a crash here
+    realsize = size * nmemb;
+    d = (struct edw_response*)userdata;
+
+    buf = realloc(d->buf, d->size + realsize + 1); //why does using repalloc cause a crash here
     if (!buf) {
         return 0;
     }
@@ -489,6 +494,54 @@ size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata) {
     return realsize;
 }
 
+
+int thrd_request(void* args) {
+    int id = *((int*)args);
+    struct edw_state* state = *((struct edw_state**)((uint8_t*)(args) + sizeof(int)));
+
+    CURL *curl;
+    curl = curl_easy_init();
+    CURLcode res;
+    struct curl_slist *list = NULL;
+    char uri[256];
+    sprintf(uri, "https://ethereum-mainnet-archive.allthatnode.com/%s", state->key_buf);
+    const char *header = "Content-Type: application/json";
+    
+    curl_easy_setopt(curl, CURLOPT_URL, uri);
+    list = curl_slist_append(list, header);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
+    char data[1024];
+    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"eth_getBlockByNumber\",\"params\":[\"0x110fec6\", true],\"id\":%d}", id);
+    size_t len = strlen(data);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
+    curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, data);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    state->bufs[id].buf = NULL;
+    state->bufs[id].size = 0;
+    state->bufs[id].cur = 0;
+
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state->bufs[id]);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+
+    curl_easy_setopt(curl, CURLOPT_URL, uri);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("curl broke! uri: %s, key len: %ld", uri, state->key_len));
+        //fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+    }
+
+    curl_slist_free_all(list);
+    curl_easy_cleanup(curl);
+
+    return 0;
+}
+
 TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
     struct edw_state *state;
     TupleTableSlot *slot;
@@ -497,97 +550,36 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
     ExecClearTuple(slot);
     state = node->fdw_state;
 
-    if (state->count >= 2) {
-        return slot;
+    if (state->count == 0 ) { //batch call 10 records to test
+        thrd_t threads[10];
+        uint8_t thrd_data[10][sizeof(int) + sizeof(struct edw_state**)];
+
+        for (int i = 0; i < 10; i ++) {
+            *((int*)(thrd_data[i])) = i;
+            *((struct edw_state**)(thrd_data[i] + sizeof(int))) = state;
+            thrd_create(&threads[i], &thrd_request, thrd_data[i]);
+        }
+        
+        for (int i = 0; i < 10; i++) {
+            thrd_join(threads[i], NULL);
+        }
     }
 
-    CURLcode res;
-    struct curl_slist *list = NULL;
-    char uri[256];
-    sprintf(uri, "https://ethereum-mainnet-archive.allthatnode.com/%s", state->key_buf);
-    const char *header = "Content-Type: application/json";
-    
-    curl_easy_setopt(state->curl, CURLOPT_URL, uri);
-    list = curl_slist_append(list, header);
-    curl_easy_setopt(state->curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(state->curl, CURLOPT_HTTPHEADER, list);
-//    char* data = "{ \"jsonrpc\":\"2.0\", \"method\":\"eth_getBlockByNumber\",\"params\":[\"0x110fec6\", true],\"id\":1}";
-    char data[1024];
-    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"eth_getBlockByNumber\",\"params\":[\"0x110fec6\", true],\"id\":%d}", state->count + 1);
-    size_t len = strlen(data);
-    curl_easy_setopt(state->curl, CURLOPT_POSTFIELDSIZE, len);
-    curl_easy_setopt(state->curl, CURLOPT_COPYPOSTFIELDS, data);
-    curl_easy_setopt(state->curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    struct MyData d = {0};
-    curl_easy_setopt(state->curl, CURLOPT_WRITEDATA, &d);
-    curl_easy_setopt(state->curl, CURLOPT_WRITEFUNCTION, write_callback);
-
-    curl_easy_setopt(state->curl, CURLOPT_URL, uri);
-    curl_easy_setopt(state->curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    res = curl_easy_perform(state->curl);
-    if (res != CURLE_OK) {
-        ereport(ERROR,
-                errcode(ERRCODE_FDW_ERROR),
-                errmsg("curl broke! uri: %s, key len: %ld", uri, state->key_len));
-        //fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-    } else {
-        //parse d.buf
-        state->buf = d.buf;
-        state->len = strlen(state->buf);
-        state->cur = 0;
-        struct edw_object *obj = edw_parse_object(state);
+    if (state->count < 10) {
+        //read data in state->bufs at index 0 - 3 (since they will be called in a batch on state->count == 0)
+        //need to rewrite parsing code to take in a edw_response (rather
+        struct edw_object *obj = edw_parse_object(&state->bufs[state->count]);
 
         int i = 0;
         edw_insert_value(slot, i++, obj, "jsonrpc", EDWT_STR);
         edw_insert_value(slot, i++, obj, "id", EDWT_INT);
         ExecStoreVirtualTuple(slot);
         edw_object_free(obj);
-        free(d.buf); //TODO: why does using pfree (along with repalloc in write_callback) cause crash
     }
-    curl_slist_free_all(list);
 
     state->count++;
 
     return slot;
-
-    /*
-    while (state->cur < state->len && edw_peek_char(state) != '{') {
-        edw_next_char(state);
-    }
-
-    if (state->cur < state->len) {
-        struct edw_object* obj = edw_parse_object(state);
-
-        int i = 0;
-        edw_insert_value(slot, i++, obj, "baseFeePerGas", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "difficulty", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "extraData", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "gasLimit", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "gasUsed", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "hash", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "logsBloom", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "miner", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "mixHash", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "nonce", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "number", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "parentHash", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "receiptsRoot", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "sha3Uncles", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "size", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "stateRoot", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "timestamp", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "totalDifficulty", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "transactionsRoot", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "withdrawalsRoot", EDWT_STR);
-
-
-        ExecStoreVirtualTuple(slot);
-        edw_object_free(obj);
-    }
-
-    return slot;*/
 }
 
 void edw_ReScanForeignScan(ForeignScanState *node) {
@@ -597,7 +589,8 @@ void edw_ReScanForeignScan(ForeignScanState *node) {
 
 void edw_EndForeignScan(ForeignScanState *node) {
     struct edw_state *state = node->fdw_state;
-    curl_easy_cleanup(state->curl);
+    curl_global_cleanup();
+//    curl_easy_cleanup(state->curl);
 //    pfree(state->buf);
     pfree(state);
 }
