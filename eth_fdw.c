@@ -7,13 +7,20 @@
 #include "optimizer/planmain.h"
 #include "utils/rel.h"
 #include "access/table.h"
+#include "access/reloptions.h"
 #include "catalog/pg_type.h"
 #include "foreign/foreign.h"
 #include "commands/defrem.h"
 #include "nodes/pg_list.h"
 
+#include "curl/curl.h"
+
+
 Datum edw_handler(PG_FUNCTION_ARGS);
+Datum edw_validator(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(edw_handler);
+PG_FUNCTION_INFO_V1(edw_validator);
+
 PG_MODULE_MAGIC; //lets postgres know that this is dynamically loadable (put in ONE source file after fmgr.h)
 
 void edw_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid);
@@ -41,6 +48,8 @@ struct edw_state {
     char* buf;
     size_t len;
     int cur;
+    CURL *curl;
+    int count;
 };
 
 struct edw_string {
@@ -95,6 +104,8 @@ void edw_list_append_value(struct edw_list *l, struct edw_value v);
 
 void edw_insert_value(TupleTableSlot *slot, int idx, struct edw_object *obj, const char* attr, enum edw_type type);
 
+size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata);
+
 Datum edw_handler(PG_FUNCTION_ARGS) {
     FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
@@ -109,11 +120,61 @@ Datum edw_handler(PG_FUNCTION_ARGS) {
     PG_RETURN_POINTER(fdwroutine);    
 }
 
+//validate table options
+Datum edw_validator(PG_FUNCTION_ARGS) {
+    List *options_list;
+    ListCell *cell;
+    
+    
+    options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+
+    foreach(cell, options_list) {
+        DefElem *def = lfirst_node(DefElem, cell);
+
+        if (!(strcmp("count", def->defname) == 0 ||
+              strcmp("url", def->defname) == 0 ||
+              strcmp("start", def->defname) == 0)) {
+            ereport(ERROR,
+                    errcode(ERRCODE_FDW_ERROR),
+                    errmsg("\"%s\" is not a valid option", def->defname),
+                    errhint("Valid table options for edw are \"start\", \"count\" and \"url\""));
+        }
+    }
+
+
+    PG_RETURN_VOID();
+}
+
 void edw_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
-    //check options
+    /*
+    Oid typid;
+    Relation rel;
+
+    //validate table schema
+    //TODO: should define the function for importing a foreign schema (look at postgres_fdw.c for hints on how to do this)
+    rel = table_open(foreigntableid, NoLock);
+
+    if (rel->rd_att->natts != 20) {
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_INVALID_COLUMN_NUMBER),
+                errmsg("incorrect schema for tutorial_fdw table %s: table must have exactly twenty columns", NameStr(rel->rd_rel->relname)));
+    }
+
+    typid = rel->rd_att->attrs[0].atttypid;
+    if (typid != TEXTOID) {
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+                errmsg("incorrect schema for tutorial_fdw table %s: table column must have type int", NameStr(rel->rd_rel->relname)));
+    }
+
+    table_close(rel, NoLock);*/
+
+    //ForeignTable *ft = GetForeignTable(foreigntableid);
+    //eth_fdw_apply_data_options(state, ft);
+
+
     //make private struct for fdw, and pass to baserel
-    //validate attribute count
-    //validate data types
+    //read options values (should have been validated in validator by now)
     //set baserel->rows (this is used to estimate best path????)
 }
 
@@ -159,20 +220,30 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
     state->cur = 0;
     state->len = 10;
 
-    if (!(f = fopen("/home/thomas/eth_fdw/blocks.json", "r"))) {
-        //error
+    const char* path = "/home/thomas/eth_fdw/data/blocks.json";
+
+    if (!(f = fopen(path, "r"))) {
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("failed to open \"%s\": fopen failed", path));
     }
 
     if (fseek(f, 0L, SEEK_END) != 0) {
-        //error
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("failed to seek to end of file \"%s\": fseek failed", path));
     }
 
     if ((bufsize = ftell(f)) == -1) {
-        //error
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("failed to find offset at end of file \"%s\": ftell failed", path));
     }
 
     if (fseek(f, 0L, SEEK_SET) != 0) {
-        //error
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("failed to seek to beginning of file \"%s\": fseek failed", path));
     }
 
     state->buf = palloc(sizeof(char) * (bufsize + 1));
@@ -180,12 +251,22 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
     state->cur = 0;
 
     if (ferror(f) != 0) {
-        //error reading
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("failed to read file \"%s\": fread failed", path));
     } else {
         state->buf[state->len] = '\0';
     }
 
     fclose(f);
+    state->curl = curl_easy_init();
+    if (!state->curl) {
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("curl failed"));
+    }
+    state->count = 0;
+
     node->fdw_state = state;
 }
 
@@ -382,6 +463,28 @@ void edw_insert_value(TupleTableSlot *slot, int idx, struct edw_object *obj, con
     }
 }
 
+
+struct MyData {
+    char* buf;
+    size_t size;
+};
+
+size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t realsize = size * nmemb;
+    struct MyData *d = (struct MyData*)userdata;
+
+    char* buf = realloc(d->buf, d->size + realsize + 1); //why does using repalloc cause a crash here
+    if (!buf) {
+        return 0;
+    }
+    d->buf = buf;
+    memcpy(&(d->buf[d->size]), ptr, realsize);
+    d->size += realsize;
+    d->buf[d->size] = '\0';
+
+    return realsize;
+}
+
 TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
     struct edw_state *state;
     TupleTableSlot *slot;
@@ -390,6 +493,61 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
     ExecClearTuple(slot);
     state = node->fdw_state;
 
+    if (state->count >= 2) {
+        return slot;
+    }
+
+    CURLcode res;
+    struct curl_slist *list = NULL;
+    const char* uri = "https://ethereum-mainnet-archive.allthatnode.com/<key>";
+    const char *header = "Content-Type: application/json";
+    
+    curl_easy_setopt(state->curl, CURLOPT_URL, uri);
+    list = curl_slist_append(list, header);
+    curl_easy_setopt(state->curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(state->curl, CURLOPT_HTTPHEADER, list);
+//    char* data = "{ \"jsonrpc\":\"2.0\", \"method\":\"eth_getBlockByNumber\",\"params\":[\"0x110fec6\", true],\"id\":1}";
+    char data[1024];
+    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"eth_getBlockByNumber\",\"params\":[\"0x110fec6\", true],\"id\":%d}", state->count + 1);
+    size_t len = strlen(data);
+    curl_easy_setopt(state->curl, CURLOPT_POSTFIELDSIZE, len);
+    curl_easy_setopt(state->curl, CURLOPT_COPYPOSTFIELDS, data);
+    curl_easy_setopt(state->curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    struct MyData d = {0};
+    curl_easy_setopt(state->curl, CURLOPT_WRITEDATA, &d);
+    curl_easy_setopt(state->curl, CURLOPT_WRITEFUNCTION, write_callback);
+
+    curl_easy_setopt(state->curl, CURLOPT_URL, uri);
+    curl_easy_setopt(state->curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    res = curl_easy_perform(state->curl);
+    if (res != CURLE_OK) {
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("curl broke!"));
+        //fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+    } else {
+        //parse d.buf
+        state->buf = d.buf;
+        state->len = strlen(state->buf);
+        state->cur = 0;
+        struct edw_object *obj = edw_parse_object(state);
+
+        int i = 0;
+        edw_insert_value(slot, i++, obj, "jsonrpc", EDWT_STR);
+        edw_insert_value(slot, i++, obj, "id", EDWT_INT);
+        ExecStoreVirtualTuple(slot);
+        edw_object_free(obj);
+        free(d.buf); //TODO: why does using pfree (along with repalloc in write_callback) cause crash
+    }
+    curl_slist_free_all(list);
+
+    state->count++;
+
+    return slot;
+
+    /*
     while (state->cur < state->len && edw_peek_char(state) != '{') {
         edw_next_char(state);
     }
@@ -398,24 +556,24 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
         struct edw_object* obj = edw_parse_object(state);
 
         int i = 0;
-        edw_insert_value(slot, i++, obj, "baseFeePerGas", EDWT_INT);
-        edw_insert_value(slot, i++, obj, "difficulty", EDWT_INT);
+        edw_insert_value(slot, i++, obj, "baseFeePerGas", EDWT_STR);
+        edw_insert_value(slot, i++, obj, "difficulty", EDWT_STR);
         edw_insert_value(slot, i++, obj, "extraData", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "gasLimit", EDWT_INT);
-        edw_insert_value(slot, i++, obj, "gasUsed", EDWT_INT);
+        edw_insert_value(slot, i++, obj, "gasLimit", EDWT_STR);
+        edw_insert_value(slot, i++, obj, "gasUsed", EDWT_STR);
         edw_insert_value(slot, i++, obj, "hash", EDWT_STR);
         edw_insert_value(slot, i++, obj, "logsBloom", EDWT_STR);
         edw_insert_value(slot, i++, obj, "miner", EDWT_STR);
         edw_insert_value(slot, i++, obj, "mixHash", EDWT_STR);
         edw_insert_value(slot, i++, obj, "nonce", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "number", EDWT_INT);
+        edw_insert_value(slot, i++, obj, "number", EDWT_STR);
         edw_insert_value(slot, i++, obj, "parentHash", EDWT_STR);
         edw_insert_value(slot, i++, obj, "receiptsRoot", EDWT_STR);
         edw_insert_value(slot, i++, obj, "sha3Uncles", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "size", EDWT_INT);
+        edw_insert_value(slot, i++, obj, "size", EDWT_STR);
         edw_insert_value(slot, i++, obj, "stateRoot", EDWT_STR);
-        edw_insert_value(slot, i++, obj, "timestamp", EDWT_INT);
-        edw_insert_value(slot, i++, obj, "totalDifficulty", EDWT_INT);
+        edw_insert_value(slot, i++, obj, "timestamp", EDWT_STR);
+        edw_insert_value(slot, i++, obj, "totalDifficulty", EDWT_STR);
         edw_insert_value(slot, i++, obj, "transactionsRoot", EDWT_STR);
         edw_insert_value(slot, i++, obj, "withdrawalsRoot", EDWT_STR);
 
@@ -424,7 +582,7 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
         edw_object_free(obj);
     }
 
-    return slot;
+    return slot;*/
 }
 
 void edw_ReScanForeignScan(ForeignScanState *node) {
@@ -434,7 +592,8 @@ void edw_ReScanForeignScan(ForeignScanState *node) {
 
 void edw_EndForeignScan(ForeignScanState *node) {
     struct edw_state *state = node->fdw_state;
-    pfree(state->buf);
+    curl_easy_cleanup(state->curl);
+//    pfree(state->buf);
     pfree(state);
 }
 

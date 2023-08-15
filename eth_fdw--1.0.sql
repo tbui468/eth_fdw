@@ -3,5 +3,11 @@ RETURNS fdw_handler
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION edw_validator(text[], oid)
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
 CREATE FOREIGN DATA WRAPPER eth_fdw
-  HANDLER edw_handler;
+  HANDLER edw_handler
+  VALIDATOR edw_validator;
