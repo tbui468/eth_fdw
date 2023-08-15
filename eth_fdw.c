@@ -45,6 +45,8 @@ enum edw_type {
 };
 
 struct edw_state {
+    char* key_buf;
+    size_t key_len;
     char* buf;
     size_t len;
     int cur;
@@ -220,7 +222,7 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
     state->cur = 0;
     state->len = 10;
 
-    const char* path = "/home/thomas/eth_fdw/data/blocks.json";
+    const char* path = "/home/thomas/eth_fdw/allthatnode.key";
 
     if (!(f = fopen(path, "r"))) {
         ereport(ERROR,
@@ -246,8 +248,8 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
                 errmsg("failed to seek to beginning of file \"%s\": fseek failed", path));
     }
 
-    state->buf = palloc(sizeof(char) * (bufsize + 1));
-    state->len = fread(state->buf, sizeof(char), bufsize, f);
+    state->key_buf = palloc(sizeof(char) * (bufsize + 1));
+    state->key_len = fread(state->key_buf, sizeof(char), bufsize, f);
     state->cur = 0;
 
     if (ferror(f) != 0) {
@@ -255,16 +257,18 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
                 errcode(ERRCODE_FDW_ERROR),
                 errmsg("failed to read file \"%s\": fread failed", path));
     } else {
-        state->buf[state->len] = '\0';
+        state->key_buf[state->key_len - 1] = '\0'; //overwriting eof/newline TODO: a bit hacky
     }
 
     fclose(f);
+
     state->curl = curl_easy_init();
     if (!state->curl) {
         ereport(ERROR,
                 errcode(ERRCODE_FDW_ERROR),
                 errmsg("curl failed"));
     }
+
     state->count = 0;
 
     node->fdw_state = state;
@@ -499,7 +503,8 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
 
     CURLcode res;
     struct curl_slist *list = NULL;
-    const char* uri = "https://ethereum-mainnet-archive.allthatnode.com/<key>";
+    char uri[256];
+    sprintf(uri, "https://ethereum-mainnet-archive.allthatnode.com/%s", state->key_buf);
     const char *header = "Content-Type: application/json";
     
     curl_easy_setopt(state->curl, CURLOPT_URL, uri);
@@ -525,7 +530,7 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
     if (res != CURLE_OK) {
         ereport(ERROR,
                 errcode(ERRCODE_FDW_ERROR),
-                errmsg("curl broke!"));
+                errmsg("curl broke! uri: %s, key len: %ld", uri, state->key_len));
         //fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
     } else {
         //parse d.buf
