@@ -52,6 +52,8 @@ struct edw_response {
     int cur;
 };
 
+#define THRD_COUNT 100
+
 struct edw_state {
     char* key_buf;
     size_t key_len;
@@ -60,7 +62,7 @@ struct edw_state {
     int cur;
     int count;
 
-    struct edw_response bufs[4];
+    struct edw_response bufs[THRD_COUNT];
 };
 
 struct edw_string {
@@ -231,6 +233,8 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
     state = palloc(sizeof(struct edw_state));
     state->cur = 0;
     state->len = 10;
+
+    elog(NOTICE, "stuff");
 
     const char* path = "/home/thomas/eth_fdw/allthatnode.key";
 
@@ -412,6 +416,14 @@ struct edw_object *edw_object_init(void) {
 }
 
 void edw_object_free(struct edw_object* o) {
+    for (int i = 0; i < o->count; i++) {
+        struct edw_entry* e = &o->entries[i];
+        if (e->value.type == EDWT_LIST) {
+            edw_list_free(e->value.as.list);
+        } else if (e->value.type == EDWT_OBJ) {
+            edw_object_free(e->value.as.object);
+        }
+    }
     pfree(o->entries);
     pfree(o);
 }
@@ -436,6 +448,14 @@ struct edw_list *edw_list_init(void) {
 }
 
 void edw_list_free(struct edw_list* l) {
+    for (int i = 0; i < l->count; i++) {
+        struct edw_value* v = &l->values[i];
+        if (v->type == EDWT_LIST) {
+            edw_list_free(v->as.list);
+        } else if (v->type == EDWT_OBJ) {
+            edw_object_free(v->as.object);
+        }
+    }
     pfree(l->values);
     pfree(l);
 }
@@ -512,7 +532,8 @@ int thrd_request(void* args) {
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
     char data[1024];
-    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"eth_getBlockByNumber\",\"params\":[\"0x110fec6\", true],\"id\":%d}", id);
+    //sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"eth_getBlockByNumber\",\"params\":[\"0x110fec6\", true],\"id\":%d}", id);
+    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"debug_getRawBlock\",\"params\":[\"0x110fec6\"],\"id\":%d}", id);
     size_t len = strlen(data);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
     curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, data);
@@ -550,24 +571,23 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
     ExecClearTuple(slot);
     state = node->fdw_state;
 
-    if (state->count == 0 ) { //batch call 10 records to test
-        thrd_t threads[10];
-        uint8_t thrd_data[10][sizeof(int) + sizeof(struct edw_state**)];
+    if (state->count == 0 ) { //batch call 12 records to test
+        thrd_t threads[THRD_COUNT];
+        uint8_t thrd_data[THRD_COUNT][sizeof(int) + sizeof(struct edw_state**)];
 
-        for (int i = 0; i < 10; i ++) {
+        for (int i = 0; i < THRD_COUNT; i ++) {
             *((int*)(thrd_data[i])) = i;
             *((struct edw_state**)(thrd_data[i] + sizeof(int))) = state;
             thrd_create(&threads[i], &thrd_request, thrd_data[i]);
         }
         
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < THRD_COUNT; i++) {
             thrd_join(threads[i], NULL);
         }
     }
 
-    if (state->count < 10) {
-        //read data in state->bufs at index 0 - 3 (since they will be called in a batch on state->count == 0)
-        //need to rewrite parsing code to take in a edw_response (rather
+    if (state->count < THRD_COUNT) {
+        //TODO: obj is not being freed properly and it's crashing (probably)
         struct edw_object *obj = edw_parse_object(&state->bufs[state->count]);
 
         int i = 0;
@@ -575,6 +595,7 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
         edw_insert_value(slot, i++, obj, "id", EDWT_INT);
         ExecStoreVirtualTuple(slot);
         edw_object_free(obj);
+        free(state->bufs[state->count].buf);
     }
 
     state->count++;
@@ -590,8 +611,6 @@ void edw_ReScanForeignScan(ForeignScanState *node) {
 void edw_EndForeignScan(ForeignScanState *node) {
     struct edw_state *state = node->fdw_state;
     curl_global_cleanup();
-//    curl_easy_cleanup(state->curl);
-//    pfree(state->buf);
     pfree(state);
 }
 

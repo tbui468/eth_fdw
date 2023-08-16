@@ -1,1 +1,19 @@
+/usr/bin/clang-10 -Wno-ignored-attributes -fno-strict-aliasing -fwrapv -Wno-unused-command-line-argument -O2  -I. -I./ -I/usr/include/postgresql/12/server -I/usr/include/postgresql/internal  -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -I/usr/include/libxml2  -I/usr/include/mit-krb5 -flto=thin -emit-llvm -c -o eth_fdw.bc eth_fdw.c
 gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -I. -I./ -I/usr/include/postgresql/12/server -I/usr/include/postgresql/internal  -Wdate-time -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -I/usr/include/libxml2  -I/usr/include/mit-krb5  -c -o eth_fdw.o eth_fdw.c
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Werror=vla -Wendif-labels -Wmissing-format-attribute -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -Wno-format-truncation -Wno-stringop-truncation -g -g -O2 -fstack-protector-strong -Wformat -Werror=format-security -fno-omit-frame-pointer -fPIC -shared -o eth_fdw.so eth_fdw.o -lcurl -L/usr/lib/x86_64-linux-gnu -Wl,-Bsymbolic-functions -Wl,-z,relro -Wl,-z,now -L/usr/lib/llvm-10/lib  -L/usr/lib/x86_64-linux-gnu/mit-krb5 -Wl,--as-needed  
+/bin/mkdir -p '/usr/lib/postgresql/12/lib'
+/bin/mkdir -p '/usr/share/postgresql/12/extension'
+/bin/mkdir -p '/usr/share/postgresql/12/extension'
+/usr/bin/install -c -m 755  eth_fdw.so '/usr/lib/postgresql/12/lib/eth_fdw.so'
+/usr/bin/install -c -m 644 .//eth_fdw.control '/usr/share/postgresql/12/extension/'
+/usr/bin/install -c -m 644 .//eth_fdw--1.0.sql  '/usr/share/postgresql/12/extension/'
+/bin/mkdir -p '/usr/lib/postgresql/12/lib/bitcode/eth_fdw'
+/bin/mkdir -p '/usr/lib/postgresql/12/lib/bitcode'/eth_fdw/
+/usr/bin/install -c -m 644 eth_fdw.bc '/usr/lib/postgresql/12/lib/bitcode'/eth_fdw/./
+cd '/usr/lib/postgresql/12/lib/bitcode' && /usr/lib/llvm-10/bin/llvm-lto -thinlto -thinlto-action=thinlink -o eth_fdw.index.bc eth_fdw/eth_fdw.bc
+DROP FOREIGN TABLE
+DROP SERVER
+DROP EXTENSION
+CREATE EXTENSION
+CREATE SERVER
+CREATE FOREIGN TABLE
