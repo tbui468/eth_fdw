@@ -16,14 +16,90 @@
 #include "curl/curl.h"
 #include <threads.h>
 
+#define THRD_COUNT 64
+#define MAX 32
 
-Datum edw_handler(PG_FUNCTION_ARGS);
-Datum edw_validator(PG_FUNCTION_ARGS);
+PG_MODULE_MAGIC; //lets postgres know that this is dynamically loadable (put in ONE source file after fmgr.h)
 PG_FUNCTION_INFO_V1(edw_handler);
 PG_FUNCTION_INFO_V1(edw_validator);
 
-PG_MODULE_MAGIC; //lets postgres know that this is dynamically loadable (put in ONE source file after fmgr.h)
+/*
+ * Shared primitive data structures and function declarations
+ */
 
+enum data_type {
+    DATA_STR,
+    DATA_INT,
+    DATA_LIST,
+    DATA_OBJ
+};
+
+struct data_buf {
+    char* buf;
+    size_t size;
+    int cur;
+};
+
+struct data_string {
+    char* start;
+    int len;
+};
+
+struct data_list {
+    struct data_value* values;
+    int count;
+    int capacity;
+};
+
+struct data_value {
+    enum data_type type;
+    union {
+        struct data_string string;
+        uint64_t integer;
+        struct data_list *list;
+        struct data_object *object;
+    } as;
+};
+
+struct data_entry {
+    struct data_string key;
+    struct data_value value;
+};
+
+struct data_object {
+    struct data_entry* entries;
+    int capacity;
+    int count;
+};
+
+struct data_object *data_object_init(void);
+void data_object_free(struct data_object* o);
+void data_object_append_entry(struct data_object *o, struct data_entry e);
+struct data_value data_object_get(struct data_object *o, const char* key);
+
+struct data_list *data_list_init(void);
+void data_list_free(struct data_list* l);
+void data_list_append_value(struct data_list *l, struct data_value v);
+
+/*
+ * Ethereum data wrapper core structs and function declarations
+ */
+
+struct edw_state {
+    char* key_buf;
+    size_t key_len;
+
+    char* buf;
+    size_t len;
+
+    int cur; //???? Think of more descriptive field name - I don't remember what this is for
+    int count; //???? Think of more descriptive field name - don't remember
+
+    struct data_buf bufs[THRD_COUNT];
+};
+
+Datum edw_handler(PG_FUNCTION_ARGS);
+Datum edw_validator(PG_FUNCTION_ARGS);
 void edw_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid);
 void edw_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid);
 ForeignScan *edw_GetForeignPlan(PlannerInfo *root, 
@@ -38,89 +114,126 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node);
 void edw_ReScanForeignScan(ForeignScanState *node);
 void edw_EndForeignScan(ForeignScanState *node);
 
-enum edw_type {
-    EDWT_STR,
-    EDWT_INT,
-    EDWT_LIST,
-    EDWT_OBJ
-};
+void edw_insert_value(TupleTableSlot *slot, int idx, struct data_object *obj, const char* attr, enum data_type type);
+void edw_insert_attr_value(TupleTableSlot *slot, int idx, const char* attr, struct data_value v);
+
+/*
+ * Json parser structs and function declarations
+ */
+
+void json_skip_whitespace(struct data_buf *res);
+bool json_is_digit(char c);
+void json_next_char(struct data_buf *res);
+char json_peek_char(struct data_buf *res);
+uint64_t json_parse_integer(struct data_buf *res);
+struct data_string json_parse_string(struct data_buf *res);
+struct data_list *json_parse_list(struct data_buf *res);
+struct data_value json_parse_value(struct data_buf *res);
+struct data_object *json_parse_object(struct data_buf *res);
+
+/*
+ * Recursive-length prefix (RLP) decoder structs and function declarations
+ */
 
 
-struct edw_response {
-    char* buf;
-    size_t size;
-    int cur;
-};
+/*
+ * Http structs and function declarations
+ */
 
-#define THRD_COUNT 64
+size_t http_write_callback(void *ptr, size_t size, size_t nmemb, void *userdata);
+int http_send_request(void* args);
 
-struct edw_state {
-    char* key_buf;
-    size_t key_len;
-    char* buf;
-    size_t len;
-    int cur;
-    int count;
 
-    struct edw_response bufs[THRD_COUNT];
-};
+/*
+ * Shared primitive data function implementations
+ */
 
-struct edw_string {
-    char* start;
-    int len;
-};
+struct data_object *data_object_init(void) {
+    struct data_object* o = palloc(sizeof(struct data_object));
 
-struct edw_list {
-    struct edw_value* values;
-    int count;
-    int capacity;
-};
+    o->capacity = 8;
+    o->count = 0;
+    o->entries = palloc(sizeof(struct data_entry) * o->capacity);
 
-struct edw_value {
-    enum edw_type type;
-    union {
-        struct edw_string string;
-        uint64_t integer;
-        struct edw_list *list;
-        struct edw_object *object;
-    } as;
-};
+    return o;
+}
 
-struct edw_entry {
-    struct edw_string key;
-    struct edw_value value;
-};
+void data_object_free(struct data_object* o) {
+    for (int i = 0; i < o->count; i++) {
+        struct data_entry* e = &o->entries[i];
+        if (e->value.type == DATA_LIST) {
+            data_list_free(e->value.as.list);
+        } else if (e->value.type == DATA_OBJ) {
+            data_object_free(e->value.as.object);
+        }
+    }
+    pfree(o->entries);
+    pfree(o);
+}
 
-struct edw_object {
-    struct edw_entry* entries;
-    int capacity;
-    int count;
-};
+void data_object_append_entry(struct data_object* o, struct data_entry e) {
+    if (o->count + 1 > o->capacity) {
+        o->capacity *= 2;
+        o->entries = repalloc(o->entries, sizeof(struct data_entry) * o->capacity);
+    }
+    o->entries[o->count] = e;
+    o->count++;
+}
 
-void edw_skip_whitespace(struct edw_response *res);
-bool edw_is_digit(char c);
-void edw_next_char(struct edw_response *res);
-char edw_peek_char(struct edw_response *res);
-uint64_t edw_parse_integer(struct edw_response *res);
-struct edw_string edw_parse_string(struct edw_response *res);
-struct edw_list *edw_parse_list(struct edw_response *res);
-struct edw_value edw_parse_value(struct edw_response *res);
-struct edw_object *edw_parse_object(struct edw_response *res);
+struct data_value data_object_get(struct data_object *o, const char* key) {
+    char buf[128];
+    int cur = 0;
+    for (int i = 0; i < o->count; i++) {
+        struct data_entry e = o->entries[i];
+        struct data_string cur_key = e.key;
+        if (cur_key.len == strlen(key) && strncmp(cur_key.start, key, cur_key.len) == 0) {
+            return e.value;
+        }
+        memcpy(buf + cur, cur_key.start, cur_key.len);
+        cur += cur_key.len; 
+    }
 
-struct edw_object *edw_object_init(void);
-void edw_object_free(struct edw_object* o);
-void edw_object_append_entry(struct edw_object *o, struct edw_entry e);
-struct edw_value edw_object_get(struct edw_object *o, const char* key);
+    buf[cur] = '\0';
+    ereport(ERROR,
+            errcode(ERRCODE_FDW_ERROR),
+            errmsg("result key now found: keys %s", buf));
+}
 
-struct edw_list *edw_list_init(void);
-void edw_list_free(struct edw_list* l);
-void edw_list_append_value(struct edw_list *l, struct edw_value v);
+struct data_list *data_list_init(void) {
+    struct data_list* l = palloc(sizeof(struct data_list));
 
-void edw_insert_value(TupleTableSlot *slot, int idx, struct edw_object *obj, const char* attr, enum edw_type type);
-void edw_insert_attr_value(TupleTableSlot *slot, int idx, const char* attr, struct edw_value v);
+    l->capacity = 8;
+    l->count = 0;
+    l->values = palloc(sizeof(struct data_value) * l->capacity);
 
-size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata);
-int thrd_request(void* args);
+    return l;
+}
+
+void data_list_free(struct data_list* l) {
+    for (int i = 0; i < l->count; i++) {
+        struct data_value* v = &l->values[i];
+        if (v->type == DATA_LIST) {
+            data_list_free(v->as.list);
+        } else if (v->type == DATA_OBJ) {
+            data_object_free(v->as.object);
+        }
+    }
+    pfree(l->values);
+    pfree(l);
+}
+
+void data_list_append_value(struct data_list *l, struct data_value v) {
+    if (l->count + 1 > l->capacity) {
+        l->capacity *= 2;
+        l->values = repalloc(l->values, sizeof(struct data_value) * l->capacity);
+    }
+    l->values[l->count] = v;
+    l->count++;
+}
+
+/*
+ * Ethererum data wrapper core function implementations
+ */
 
 Datum edw_handler(PG_FUNCTION_ARGS) {
     FdwRoutine *fdwroutine = makeNode(FdwRoutine);
@@ -284,223 +397,19 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
     node->fdw_state = state;
 }
 
-void edw_skip_whitespace(struct edw_response *res) {
-    char c = res->buf[res->cur];
-    while (res->cur < res->size && (c == ' ' || c == '\n' || c == '\t')) {
-        res->cur++;
-        c = res->buf[res->cur];
-    }
-}
 
-bool edw_is_digit(char c) {
-    return '0' <= c && c <= '9'; 
-}
-
-void edw_next_char(struct edw_response *res) {
-    edw_skip_whitespace(res);
-    res->cur++;
-}
-
-char edw_peek_char(struct edw_response *res) {
-    edw_skip_whitespace(res);
-    return res->buf[res->cur];
-}
-
-uint64_t edw_parse_integer(struct edw_response *res) {
-    char* start = &res->buf[res->cur];
-
-    while (edw_is_digit(edw_peek_char(res))) {
-        edw_next_char(res);
-    }
-
-    uint64_t final;
-    sscanf(start, "%ld", &final);
-
-    return final;
-}
-
-struct edw_string edw_parse_string(struct edw_response *res) {
-    struct edw_string s;
-    edw_next_char(res); //"
-
-    s.start = &res->buf[res->cur];
-    s.len = 0;
-
-    while (edw_peek_char(res) != '"') {
-        s.len++;
-        edw_next_char(res);
-    }
-
-    edw_next_char(res); //"
-
-    return s;
-}
-
-struct edw_list *edw_parse_list(struct edw_response *res) {
-    struct edw_list *l;
-    edw_next_char(res); //[
-
-    l = edw_list_init();
-
-    while (edw_peek_char(res) != ']') {
-        edw_list_append_value(l, edw_parse_value(res));
-
-        
-        if (edw_peek_char(res) == ',') {
-            edw_next_char(res);
-        }
-    }
-
-    edw_next_char(res); //]
-
-    return l;
-}
-
-struct edw_value edw_parse_value(struct edw_response *res) {
-    struct edw_value v;
-
-    switch (edw_peek_char(res)) {
-        case '[':
-            v.type = EDWT_LIST;
-            v.as.list = edw_parse_list(res);
-            break;
-        case '"':
-            v.type = EDWT_STR;
-            v.as.string = edw_parse_string(res);
-            break;
-        case '{':
-            v.type = EDWT_OBJ;
-            v.as.object = edw_parse_object(res);
-            break;
-        default:
-            v.type = EDWT_INT;
-            v.as.integer = edw_parse_integer(res);
-            break;
-    }
-
-    return v;
-}
-
-struct edw_object *edw_parse_object(struct edw_response *res) {
-    struct edw_object *obj;
-    struct edw_entry e;
-    edw_next_char(res); //{
-
-    obj = edw_object_init();
-
-    while (edw_peek_char(res) != '}') {
-
-        e.key = edw_parse_string(res); //key
-        edw_next_char(res); //:
-        e.value = edw_parse_value(res);
-
-        edw_object_append_entry(obj, e);
-
-        if (edw_peek_char(res) == ',') {
-            edw_next_char(res);
-        }
-    }
-
-    edw_next_char(res); //}
-
-    return obj;
-}
-
-struct edw_object *edw_object_init(void) {
-    struct edw_object* o = palloc(sizeof(struct edw_object));
-
-    o->capacity = 8;
-    o->count = 0;
-    o->entries = palloc(sizeof(struct edw_entry) * o->capacity);
-
-    return o;
-}
-
-void edw_object_free(struct edw_object* o) {
-    for (int i = 0; i < o->count; i++) {
-        struct edw_entry* e = &o->entries[i];
-        if (e->value.type == EDWT_LIST) {
-            edw_list_free(e->value.as.list);
-        } else if (e->value.type == EDWT_OBJ) {
-            edw_object_free(e->value.as.object);
-        }
-    }
-    pfree(o->entries);
-    pfree(o);
-}
-
-void edw_object_append_entry(struct edw_object* o, struct edw_entry e) {
-    if (o->count + 1 > o->capacity) {
-        o->capacity *= 2;
-        o->entries = repalloc(o->entries, sizeof(struct edw_entry) * o->capacity);
-    }
-    o->entries[o->count] = e;
-    o->count++;
-}
-
-struct edw_value edw_object_get(struct edw_object *o, const char* key) {
-    char buf[128];
-    int cur = 0;
-    for (int i = 0; i < o->count; i++) {
-        struct edw_entry e = o->entries[i];
-        struct edw_string cur_key = e.key;
-        if (cur_key.len == strlen(key) && strncmp(cur_key.start, key, cur_key.len) == 0) {
-            return e.value;
-        }
-        memcpy(buf + cur, cur_key.start, cur_key.len);
-        cur += cur_key.len; 
-    }
-
-    buf[cur] = '\0';
-    ereport(ERROR,
-            errcode(ERRCODE_FDW_ERROR),
-            errmsg("result key now found: keys %s", buf));
-}
-
-struct edw_list *edw_list_init(void) {
-    struct edw_list* l = palloc(sizeof(struct edw_list));
-
-    l->capacity = 8;
-    l->count = 0;
-    l->values = palloc(sizeof(struct edw_value) * l->capacity);
-
-    return l;
-}
-
-void edw_list_free(struct edw_list* l) {
-    for (int i = 0; i < l->count; i++) {
-        struct edw_value* v = &l->values[i];
-        if (v->type == EDWT_LIST) {
-            edw_list_free(v->as.list);
-        } else if (v->type == EDWT_OBJ) {
-            edw_object_free(v->as.object);
-        }
-    }
-    pfree(l->values);
-    pfree(l);
-}
-
-void edw_list_append_value(struct edw_list *l, struct edw_value v) {
-    if (l->count + 1 > l->capacity) {
-        l->capacity *= 2;
-        l->values = repalloc(l->values, sizeof(struct edw_value) * l->capacity);
-    }
-    l->values[l->count] = v;
-    l->count++;
-}
-
-void edw_insert_value(TupleTableSlot *slot, int idx, struct edw_object *obj, const char* attr, enum edw_type type) {
+void edw_insert_value(TupleTableSlot *slot, int idx, struct data_object *obj, const char* attr, enum data_type type) {
     char buf[1028];
     for (int i = 0; i < obj->count; i++) {
-        struct edw_entry e = obj->entries[i];
+        struct data_entry e = obj->entries[i];
         if (strncmp(e.key.start, attr, strlen(attr)) == 0) {
             slot->tts_isnull[idx] = false;
 
             switch (type) {
-                case EDWT_INT:
+                case DATA_INT:
                     slot->tts_values[idx] = Int64GetDatum(e.value.as.integer);
                     break;
-                case EDWT_STR:
+                case DATA_STR:
                     memcpy(buf, e.value.as.string.start, e.value.as.string.len);
                     buf[e.value.as.string.len] = '\0';
                     slot->tts_values[idx] = CStringGetTextDatum(buf);
@@ -515,13 +424,13 @@ void edw_insert_value(TupleTableSlot *slot, int idx, struct edw_object *obj, con
 }
 
 
-void edw_insert_attr_value(TupleTableSlot *slot, int idx, const char* attr, struct edw_value v) {
+void edw_insert_attr_value(TupleTableSlot *slot, int idx, const char* attr, struct data_value v) {
     slot->tts_isnull[idx] = false;
     switch (v.type) {
-        case EDWT_INT:
+        case DATA_INT:
             slot->tts_values[idx] = Int64GetDatum(v.as.integer);
             break;
-        case EDWT_STR: {
+        case DATA_STR: {
             char* buf = palloc(sizeof(char) * (v.as.string.len + 1));
             memcpy(buf, v.as.string.start, v.as.string.len);
             buf[v.as.string.len] = '\0';
@@ -534,13 +443,226 @@ void edw_insert_attr_value(TupleTableSlot *slot, int idx, const char* attr, stru
     }
 }
 
-size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata) {
+TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
+    struct edw_state *state;
+    TupleTableSlot *slot;
+
+    slot = node->ss.ss_ScanTupleSlot;
+    ExecClearTuple(slot);
+    state = node->fdw_state;
+
+    if (state->count < MAX) {
+        //batch http requests by THRD_COUNT
+        if (state->count % THRD_COUNT == 0) {
+            thrd_t threads[THRD_COUNT];
+            uint8_t thrd_data[THRD_COUNT][sizeof(int) + sizeof(struct edw_state**)];
+
+            for (int i = 0; i < THRD_COUNT; i++) {
+                *((int*)(thrd_data[i])) = (state->count / THRD_COUNT) * THRD_COUNT + i;
+                *((struct edw_state**)(thrd_data[i] + sizeof(int))) = state;
+                thrd_create(&threads[i], &http_send_request, thrd_data[i]);
+            }
+            
+            for (int i = 0; i < THRD_COUNT; i++) {
+                thrd_join(threads[i], NULL);
+            }
+        }
+
+        if (state->count < MAX) {
+            struct data_object *obj = json_parse_object(&state->bufs[state->count % THRD_COUNT]);
+            struct data_value raw_data = data_object_get(obj, "result");
+            //struct data_list *list = rlp_decode(raw_data);
+
+            int i = 0;
+            edw_insert_attr_value(slot, i++, "result", data_object_get(obj, "result"));
+            /*
+            edw_insert_attr_value(slot, i++, "difficulty", data_object_get(v.as.object, "difficulty"));
+            edw_insert_attr_value(slot, i++, "baseFeePerGas", data_object_get(v.as.object, "baseFeePerGas"));
+            edw_insert_attr_value(slot, i++, "extraData", data_object_get(v.as.object, "extraData"));
+            edw_insert_attr_value(slot, i++, "gasLimit", data_object_get(v.as.object, "gasLimit"));
+            edw_insert_attr_value(slot, i++, "gasUsed", data_object_get(v.as.object, "gasUsed"));
+
+            edw_insert_attr_value(slot, i++, "hash", data_object_get(v.as.object, "hash"));
+            edw_insert_attr_value(slot, i++, "logsBloom", data_object_get(v.as.object, "logsBloom"));
+            edw_insert_attr_value(slot, i++, "miner", data_object_get(v.as.object, "miner"));
+            edw_insert_attr_value(slot, i++, "mixHash", data_object_get(v.as.object, "mixHash"));
+            edw_insert_attr_value(slot, i++, "nonce", data_object_get(v.as.object, "nonce"));
+
+            edw_insert_attr_value(slot, i++, "number", data_object_get(v.as.object, "number"));
+            edw_insert_attr_value(slot, i++, "parentHash", data_object_get(v.as.object, "parentHash"));
+            edw_insert_attr_value(slot, i++, "receiptsRoot", data_object_get(v.as.object, "receiptsRoot"));
+            edw_insert_attr_value(slot, i++, "sha3Uncles", data_object_get(v.as.object, "sha3Uncles"));
+            edw_insert_attr_value(slot, i++, "size", data_object_get(v.as.object, "size"));
+
+            edw_insert_attr_value(slot, i++, "stateRoot", data_object_get(v.as.object, "stateRoot"));
+            edw_insert_attr_value(slot, i++, "timestamp", data_object_get(v.as.object, "timestamp"));
+            edw_insert_attr_value(slot, i++, "transactionsRoot", data_object_get(v.as.object, "transactionsRoot"));
+            edw_insert_attr_value(slot, i++, "withdrawalsRoot", data_object_get(v.as.object, "withdrawalsRoot"));
+            edw_insert_attr_value(slot, i++, "totalDifficulty", data_object_get(v.as.object, "totalDifficulty"));*/
+
+            ExecStoreVirtualTuple(slot);
+            data_object_free(obj);
+            free(state->bufs[state->count % THRD_COUNT].buf);
+        }
+    }
+
+    state->count++;
+
+    return slot;
+}
+
+void edw_ReScanForeignScan(ForeignScanState *node) {
+    struct edw_state *state = node->fdw_state;
+    state->cur = 0;
+}
+
+void edw_EndForeignScan(ForeignScanState *node) {
+    struct edw_state *state = node->fdw_state;
+    curl_global_cleanup();
+    pfree(state);
+}
+
+/*
+ * Json parser function implementations
+ */
+
+void json_skip_whitespace(struct data_buf *res) {
+    char c = res->buf[res->cur];
+    while (res->cur < res->size && (c == ' ' || c == '\n' || c == '\t')) {
+        res->cur++;
+        c = res->buf[res->cur];
+    }
+}
+
+bool json_is_digit(char c) {
+    return '0' <= c && c <= '9'; 
+}
+
+void json_next_char(struct data_buf *res) {
+    json_skip_whitespace(res);
+    res->cur++;
+}
+
+char json_peek_char(struct data_buf *res) {
+    json_skip_whitespace(res);
+    return res->buf[res->cur];
+}
+
+uint64_t json_parse_integer(struct data_buf *res) {
+    char* start = &res->buf[res->cur];
+
+    while (json_is_digit(json_peek_char(res))) {
+        json_next_char(res);
+    }
+
+    uint64_t final;
+    sscanf(start, "%ld", &final);
+
+    return final;
+}
+
+struct data_string json_parse_string(struct data_buf *res) {
+    struct data_string s;
+    json_next_char(res); //"
+
+    s.start = &res->buf[res->cur];
+    s.len = 0;
+
+    while (json_peek_char(res) != '"') {
+        s.len++;
+        json_next_char(res);
+    }
+
+    json_next_char(res); //"
+
+    return s;
+}
+
+struct data_list *json_parse_list(struct data_buf *res) {
+    struct data_list *l;
+    json_next_char(res); //[
+
+    l = data_list_init();
+
+    while (json_peek_char(res) != ']') {
+        data_list_append_value(l, json_parse_value(res));
+
+        
+        if (json_peek_char(res) == ',') {
+            json_next_char(res);
+        }
+    }
+
+    json_next_char(res); //]
+
+    return l;
+}
+
+struct data_value json_parse_value(struct data_buf *res) {
+    struct data_value v;
+
+    switch (json_peek_char(res)) {
+        case '[':
+            v.type = DATA_LIST;
+            v.as.list = json_parse_list(res);
+            break;
+        case '"':
+            v.type = DATA_STR;
+            v.as.string = json_parse_string(res);
+            break;
+        case '{':
+            v.type = DATA_OBJ;
+            v.as.object = json_parse_object(res);
+            break;
+        default:
+            v.type = DATA_INT;
+            v.as.integer = json_parse_integer(res);
+            break;
+    }
+
+    return v;
+}
+
+struct data_object *json_parse_object(struct data_buf *res) {
+    struct data_object *obj;
+    struct data_entry e;
+    json_next_char(res); //{
+
+    obj = data_object_init();
+
+    while (json_peek_char(res) != '}') {
+
+        e.key = json_parse_string(res); //key
+        json_next_char(res); //:
+        e.value = json_parse_value(res);
+
+        data_object_append_entry(obj, e);
+
+        if (json_peek_char(res) == ',') {
+            json_next_char(res);
+        }
+    }
+
+    json_next_char(res); //}
+
+    return obj;
+}
+
+/*
+ * Recursive-length prefix decoder function implementations
+ */
+
+/*
+ * Http request function implementations
+ */
+
+size_t http_write_callback(void *ptr, size_t size, size_t nmemb, void *userdata) {
     size_t realsize;
-    struct edw_response *d;
+    struct data_buf *d;
     char *buf;
 
     realsize = size * nmemb;
-    d = (struct edw_response*)userdata;
+    d = (struct data_buf*)userdata;
 
     buf = realloc(d->buf, d->size + realsize + 1); //why does using repalloc cause a crash here
     if (!buf) {
@@ -555,7 +677,7 @@ size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata) {
 }
 
 
-int thrd_request(void* args) {
+int http_send_request(void* args) {
     int i = *((int*)args);
     struct edw_state* state = *((struct edw_state**)((uint8_t*)(args) + sizeof(int)));
     int id = i % THRD_COUNT;
@@ -584,7 +706,7 @@ int thrd_request(void* args) {
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state->bufs[id]);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
 
     curl_easy_setopt(curl, CURLOPT_URL, uri);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -614,85 +736,5 @@ int thrd_request(void* args) {
     curl_easy_cleanup(curl);
 
     return 0;
-}
-
-
-TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
-    struct edw_state *state;
-    TupleTableSlot *slot;
-
-    slot = node->ss.ss_ScanTupleSlot;
-    ExecClearTuple(slot);
-    state = node->fdw_state;
-
-    int MAX = 64;
-
-    if (state->count < MAX) {
-        if (state->count % THRD_COUNT == 0) { //batch by thread count
-            thrd_t threads[THRD_COUNT];
-            uint8_t thrd_data[THRD_COUNT][sizeof(int) + sizeof(struct edw_state**)];
-
-            for (int i = 0; i < THRD_COUNT; i++) {
-                *((int*)(thrd_data[i])) = (state->count / THRD_COUNT) * THRD_COUNT + i;
-                *((struct edw_state**)(thrd_data[i] + sizeof(int))) = state;
-                thrd_create(&threads[i], &thrd_request, thrd_data[i]);
-            }
-            
-            for (int i = 0; i < THRD_COUNT; i++) {
-                thrd_join(threads[i], NULL);
-            }
-        }
-
-        if (state->count < MAX) {
-            struct edw_object *obj = edw_parse_object(&state->bufs[state->count % THRD_COUNT]);
-            //struct edw_value v = edw_object_get(obj, "result");
-
-            int i = 0;
-            edw_insert_attr_value(slot, i++, "result", edw_object_get(obj, "result"));
-            /*
-            edw_insert_attr_value(slot, i++, "difficulty", edw_object_get(v.as.object, "difficulty"));
-            edw_insert_attr_value(slot, i++, "baseFeePerGas", edw_object_get(v.as.object, "baseFeePerGas"));
-            edw_insert_attr_value(slot, i++, "extraData", edw_object_get(v.as.object, "extraData"));
-            edw_insert_attr_value(slot, i++, "gasLimit", edw_object_get(v.as.object, "gasLimit"));
-            edw_insert_attr_value(slot, i++, "gasUsed", edw_object_get(v.as.object, "gasUsed"));
-
-            edw_insert_attr_value(slot, i++, "hash", edw_object_get(v.as.object, "hash"));
-            edw_insert_attr_value(slot, i++, "logsBloom", edw_object_get(v.as.object, "logsBloom"));
-            edw_insert_attr_value(slot, i++, "miner", edw_object_get(v.as.object, "miner"));
-            edw_insert_attr_value(slot, i++, "mixHash", edw_object_get(v.as.object, "mixHash"));
-            edw_insert_attr_value(slot, i++, "nonce", edw_object_get(v.as.object, "nonce"));
-
-            edw_insert_attr_value(slot, i++, "number", edw_object_get(v.as.object, "number"));
-            edw_insert_attr_value(slot, i++, "parentHash", edw_object_get(v.as.object, "parentHash"));
-            edw_insert_attr_value(slot, i++, "receiptsRoot", edw_object_get(v.as.object, "receiptsRoot"));
-            edw_insert_attr_value(slot, i++, "sha3Uncles", edw_object_get(v.as.object, "sha3Uncles"));
-            edw_insert_attr_value(slot, i++, "size", edw_object_get(v.as.object, "size"));
-
-            edw_insert_attr_value(slot, i++, "stateRoot", edw_object_get(v.as.object, "stateRoot"));
-            edw_insert_attr_value(slot, i++, "timestamp", edw_object_get(v.as.object, "timestamp"));
-            edw_insert_attr_value(slot, i++, "transactionsRoot", edw_object_get(v.as.object, "transactionsRoot"));
-            edw_insert_attr_value(slot, i++, "withdrawalsRoot", edw_object_get(v.as.object, "withdrawalsRoot"));
-            edw_insert_attr_value(slot, i++, "totalDifficulty", edw_object_get(v.as.object, "totalDifficulty"));*/
-
-            ExecStoreVirtualTuple(slot);
-            edw_object_free(obj);
-            free(state->bufs[state->count % THRD_COUNT].buf);
-        }
-    }
-
-    state->count++;
-
-    return slot;
-}
-
-void edw_ReScanForeignScan(ForeignScanState *node) {
-    struct edw_state *state = node->fdw_state;
-    state->cur = 0;
-}
-
-void edw_EndForeignScan(ForeignScanState *node) {
-    struct edw_state *state = node->fdw_state;
-    curl_global_cleanup();
-    pfree(state);
 }
 
