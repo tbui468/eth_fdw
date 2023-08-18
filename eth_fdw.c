@@ -135,6 +135,12 @@ struct data_object *json_parse_object(struct data_buf *res);
  * Recursive-length prefix (RLP) decoder structs and function declarations
  */
 
+struct data_value rlp_decode_raw_buf(struct data_buf *buf);
+struct data_value rlp_parse_value(struct data_buf *buf);
+int rlp_peek_hex(struct data_buf *buf, int bytes);
+int rlp_next_hex(struct data_buf *buf, int bytes);
+struct data_value rlp_parse_string(struct data_buf *buf, bool is_long);
+struct data_value rlp_parse_list(struct data_buf *buf, bool is_long);
 
 /*
  * Http structs and function declarations
@@ -470,11 +476,39 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
 
         if (state->count < MAX) {
             struct data_object *obj = json_parse_object(&state->bufs[state->count % THRD_COUNT]);
-            struct data_value raw_data = data_object_get(obj, "result");
-            //struct data_list *list = rlp_decode(raw_data);
+            struct data_value s = data_object_get(obj, "result");
+            struct data_buf buf;
+            buf.buf = s.as.string.start;
+            buf.size = s.as.string.len;
+            buf.cur = 0;
+            struct data_value list = rlp_decode_raw_buf(&buf);
 
             int i = 0;
-            edw_insert_attr_value(slot, i++, "result", data_object_get(obj, "result"));
+
+            edw_insert_attr_value(slot, i++, "parentHash", list.as.list->values[0]);
+            edw_insert_attr_value(slot, i++, "sha3Uncles", list.as.list->values[1]);
+            edw_insert_attr_value(slot, i++, "miner", list.as.list->values[2]);
+            edw_insert_attr_value(slot, i++, "stateRoot", list.as.list->values[3]);
+            edw_insert_attr_value(slot, i++, "transactionRoot", list.as.list->values[4]);
+
+            edw_insert_attr_value(slot, i++, "receiptsRoot", list.as.list->values[5]);
+            edw_insert_attr_value(slot, i++, "logsBloom", list.as.list->values[6]);
+            edw_insert_attr_value(slot, i++, "difficulty", list.as.list->values[7]);
+            edw_insert_attr_value(slot, i++, "number", list.as.list->values[8]);
+            edw_insert_attr_value(slot, i++, "gasLimit", list.as.list->values[9]);
+
+            edw_insert_attr_value(slot, i++, "gasUsed", list.as.list->values[10]);
+            edw_insert_attr_value(slot, i++, "timestamp", list.as.list->values[11]);
+            edw_insert_attr_value(slot, i++, "extraData", list.as.list->values[12]);
+            edw_insert_attr_value(slot, i++, "mixHash", list.as.list->values[13]);
+            edw_insert_attr_value(slot, i++, "nonce", list.as.list->values[14]);
+
+            edw_insert_attr_value(slot, i++, "baseFeeParGas", list.as.list->values[15]);
+            edw_insert_attr_value(slot, i++, "withdrawalsRoot", list.as.list->values[16]);
+
+            /*
+            int i = 0;
+            edw_insert_attr_value(slot, i++, "result", data_object_get(obj, "result"));*/
             /*
             edw_insert_attr_value(slot, i++, "difficulty", data_object_get(v.as.object, "difficulty"));
             edw_insert_attr_value(slot, i++, "baseFeePerGas", data_object_get(v.as.object, "baseFeePerGas"));
@@ -651,6 +685,97 @@ struct data_object *json_parse_object(struct data_buf *res) {
 /*
  * Recursive-length prefix decoder function implementations
  */
+
+struct data_value rlp_decode_raw_buf(struct data_buf* buf) {
+    //seek until we find 'x'
+    char c;
+    while ((c = buf->buf[buf->cur]) != 'x') {
+        buf->cur++;
+    }
+
+    buf->cur++; //skip 'x'
+
+    return rlp_parse_value(buf);
+}
+
+struct data_value rlp_parse_value(struct data_buf* buf) {
+    int hex = rlp_peek_hex(buf, 1);
+
+    if (0x80 <= hex && hex <= 0xb7) {
+        return rlp_parse_string(buf, false);
+    } else if (0xb8 <= hex && hex <= 0xbf) {
+        return rlp_parse_string(buf, true);
+    } else if (0xc0 <= hex && hex <= 0xf7) {
+        return rlp_parse_list(buf, false);
+    } else if (0xf8 <= hex && hex <= 0xff) {
+        return rlp_parse_list(buf, true);
+    }
+
+    ereport(ERROR,
+            errcode(ERRCODE_FDW_ERROR),
+            errmsg("invalid rlp format"));
+}
+
+int rlp_peek_hex(struct data_buf *buf, int bytes) {
+    int len;
+    char hex[128];
+
+    len = bytes * 2;
+    memcpy(hex, &buf->buf[buf->cur], sizeof(char) * len);
+    hex[len] = '\0';
+    return (int)strtol(hex, NULL, 16);
+}
+
+int rlp_next_hex(struct data_buf *buf, int bytes) {
+    int hex = rlp_peek_hex(buf, bytes);
+    buf->cur += bytes * 2;
+    return hex;
+}
+
+struct data_value rlp_parse_string(struct data_buf *buf, bool is_long) {
+    int payload_len, payload_len_bytes;
+    struct data_value v;
+
+    if (!is_long) {
+        payload_len = rlp_next_hex(buf, 1) - 0x80;
+    } else {
+        payload_len_bytes = rlp_next_hex(buf, 1) - 0xb7;
+        payload_len = rlp_next_hex(buf, payload_len_bytes);
+    }
+
+    v.type = DATA_STR;
+    v.as.string.start = &buf->buf[buf->cur];
+    v.as.string.len = payload_len * 2;
+
+    buf->cur += payload_len * 2;
+
+    return v;
+}
+
+struct data_value rlp_parse_list(struct data_buf *buf, bool is_long) {
+    int payload_len, payload_len_bytes, end;
+    struct data_list *l;
+    struct data_value v;
+
+    if (!is_long) {
+        payload_len = rlp_next_hex(buf, 1) - 0xc0;
+    } else {
+        payload_len_bytes = rlp_next_hex(buf, 1) - 0xf7;
+        payload_len = rlp_next_hex(buf, payload_len_bytes);
+    }
+
+    end = buf->cur + payload_len * 2;
+
+    l = data_list_init();
+
+    while (buf->cur < end) {
+        data_list_append_value(l, rlp_parse_value(buf));
+    }
+
+    v.type = DATA_LIST;
+    v.as.list = l;
+    return v;
+}
 
 /*
  * Http request function implementations

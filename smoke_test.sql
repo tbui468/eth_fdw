@@ -4,31 +4,23 @@ DROP EXTENSION IF EXISTS eth_fdw CASCADE; --drops eth_server, eth_view, eth_tabl
 CREATE EXTENSION eth_fdw;
 CREATE SERVER eth_server FOREIGN DATA WRAPPER eth_fdw;
 CREATE FOREIGN TABLE eth_table (
-            number TEXT
-    /*
-            difficulty TEXT,
-            baseFeePerGas TEXT,
-            extraData TEXT,
-            gasLimit TEXT,
-            gasUsed TEXT,
-
-            hash TEXT,
-            logsBloom TEXT,
-            miner TEXT,
-            mixHash TEXT,
-            nonce TEXT
-
-            number TEXT,
-            parentHash TEXT,
-            receiptsRoot TEXT,
-            sha3Uncles TEXT,
-            size TEXT
-
-            stateRoot TEXT,
-            timestamp TEXT,
-            transactionsRoot TEXT,
-            withdrawalsRoot TEXT,
-            totalDifficulty TEXT*/
+parentHash TEXT,
+sha3Uncles TEXT,
+miner TEXT,
+stateRoot TEXT,
+transactionsRoot TEXT,
+receiptsRoot TEXT,
+logsBloom TEXT,
+difficulty TEXT,
+number TEXT,
+gasLimit TEXT,
+gasUsed TEXT,
+timestamp TEXT,
+extraData TEXT,
+mixHash TEXT,
+nonce TEXT,
+baseFeePerGas TEXT,
+withdrawalsRoot TEXT
                             ) SERVER eth_server OPTIONS ( start '1', count '100', url '/home/thomas/eth_fdw/blocks.json' );
 
 
