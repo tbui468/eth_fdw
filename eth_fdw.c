@@ -477,11 +477,27 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
         if (state->count < MAX) {
             struct data_object *obj = json_parse_object(&state->bufs[state->count % THRD_COUNT]);
             struct data_value s = data_object_get(obj, "result");
+
             struct data_buf buf;
             buf.buf = s.as.string.start;
             buf.size = s.as.string.len;
             buf.cur = 0;
-            struct data_value list = rlp_decode_raw_buf(&buf);
+            struct data_value list = rlp_decode_raw_buf(&buf).as.list->values[0];
+
+            //TODO:
+            //index 0 is the header
+            //index 1 is the transactions
+            //  transactions are currently encoded as a string, so need to run rlp_decode_raw_buf
+            //      one more time on each transaction
+            //  The first bye is the transaction type (type 2 for shanghai blocks)
+            //  will need to track transaction index too
+            //  block number is foreign key in this table
+            //  Put them in table as a 2d array
+            //index 2 is uncles (?)
+            //  empty for now, so just ignore
+            //index 3 is the withdrawals
+            //  should withdrawal index be tracked too?
+            //  put them in a 2d array
 
             int i = 0;
 
@@ -505,34 +521,6 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
 
             edw_insert_attr_value(slot, i++, "baseFeeParGas", list.as.list->values[15]);
             edw_insert_attr_value(slot, i++, "withdrawalsRoot", list.as.list->values[16]);
-
-            /*
-            int i = 0;
-            edw_insert_attr_value(slot, i++, "result", data_object_get(obj, "result"));*/
-            /*
-            edw_insert_attr_value(slot, i++, "difficulty", data_object_get(v.as.object, "difficulty"));
-            edw_insert_attr_value(slot, i++, "baseFeePerGas", data_object_get(v.as.object, "baseFeePerGas"));
-            edw_insert_attr_value(slot, i++, "extraData", data_object_get(v.as.object, "extraData"));
-            edw_insert_attr_value(slot, i++, "gasLimit", data_object_get(v.as.object, "gasLimit"));
-            edw_insert_attr_value(slot, i++, "gasUsed", data_object_get(v.as.object, "gasUsed"));
-
-            edw_insert_attr_value(slot, i++, "hash", data_object_get(v.as.object, "hash"));
-            edw_insert_attr_value(slot, i++, "logsBloom", data_object_get(v.as.object, "logsBloom"));
-            edw_insert_attr_value(slot, i++, "miner", data_object_get(v.as.object, "miner"));
-            edw_insert_attr_value(slot, i++, "mixHash", data_object_get(v.as.object, "mixHash"));
-            edw_insert_attr_value(slot, i++, "nonce", data_object_get(v.as.object, "nonce"));
-
-            edw_insert_attr_value(slot, i++, "number", data_object_get(v.as.object, "number"));
-            edw_insert_attr_value(slot, i++, "parentHash", data_object_get(v.as.object, "parentHash"));
-            edw_insert_attr_value(slot, i++, "receiptsRoot", data_object_get(v.as.object, "receiptsRoot"));
-            edw_insert_attr_value(slot, i++, "sha3Uncles", data_object_get(v.as.object, "sha3Uncles"));
-            edw_insert_attr_value(slot, i++, "size", data_object_get(v.as.object, "size"));
-
-            edw_insert_attr_value(slot, i++, "stateRoot", data_object_get(v.as.object, "stateRoot"));
-            edw_insert_attr_value(slot, i++, "timestamp", data_object_get(v.as.object, "timestamp"));
-            edw_insert_attr_value(slot, i++, "transactionsRoot", data_object_get(v.as.object, "transactionsRoot"));
-            edw_insert_attr_value(slot, i++, "withdrawalsRoot", data_object_get(v.as.object, "withdrawalsRoot"));
-            edw_insert_attr_value(slot, i++, "totalDifficulty", data_object_get(v.as.object, "totalDifficulty"));*/
 
             ExecStoreVirtualTuple(slot);
             data_object_free(obj);
@@ -701,7 +689,12 @@ struct data_value rlp_decode_raw_buf(struct data_buf* buf) {
 struct data_value rlp_parse_value(struct data_buf* buf) {
     int hex = rlp_peek_hex(buf, 1);
 
-    if (0x80 <= hex && hex <= 0xb7) {
+    if (0x0 <= hex && hex <= 0x7f) {
+        struct data_value v;
+        v.type = DATA_INT;
+        v.as.integer = rlp_next_hex(buf, 1);
+        return v;
+    } else if (0x80 <= hex && hex <= 0xb7) {
         return rlp_parse_string(buf, false);
     } else if (0xb8 <= hex && hex <= 0xbf) {
         return rlp_parse_string(buf, true);
@@ -823,7 +816,7 @@ int http_send_request(void* args) {
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
 
     char data[128];
-    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"debug_getRawHeader\",\"params\":[\"0x110fec6\"],\"id\":%d}", i);
+    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"debug_getRawBlock\",\"params\":[\"0x110fec6\"],\"id\":%d}", i);
     size_t len = strlen(data);
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
