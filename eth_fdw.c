@@ -17,7 +17,7 @@
 #include <threads.h>
 
 #define THRD_COUNT 64
-#define MAX 3
+#define MAX 64
 
 PG_MODULE_MAGIC; //lets postgres know that this is dynamically loadable (put in ONE source file after fmgr.h)
 PG_FUNCTION_INFO_V1(edw_handler);
@@ -941,16 +941,16 @@ int http_send_request(void* args) {
     CURLcode res;
     struct curl_slist *list;
     struct edw_state *state;
-    int i, id;
+    int off, id;
     char uri[128];
     char data[128];
     size_t len;
     long http_code;
     const char *header = "Content-Type: application/json";
 
-    i = *((int*)args);
+    off = *((int*)args);
     state = *((struct edw_state**)((uint8_t*)(args) + sizeof(int)));
-    id = i % THRD_COUNT;
+    id = off % THRD_COUNT;
 
     curl = curl_easy_init();
     list = NULL;
@@ -963,7 +963,12 @@ int http_send_request(void* args) {
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
 
-    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"debug_getRawBlock\",\"params\":[\"0x110fec6\"],\"id\":%d}", i);
+    const int start = 17891014;
+    char hex[16];
+    hex[0] = '0';
+    hex[1] = 'x';
+    sprintf(hex + 2, "%X", start + off);
+    sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"debug_getRawBlock\",\"params\":[\"%s\"],\"id\":%d}", hex, off);
     len = strlen(data);
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);

@@ -27,6 +27,6 @@ withdrawals TEXT[][]
 
 
 CREATE MATERIALIZED VIEW eth_view AS SELECT * FROM eth_table;
-SELECT number, transactions FROM eth_view;
+SELECT number, nonce FROM eth_view;
 
 --REFRESH MATERIALIZED VIEW eth_view;
