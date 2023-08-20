@@ -21,11 +21,12 @@ mixHash TEXT,
 nonce TEXT,
 baseFeePerGas TEXT,
 withdrawalsRoot TEXT,
-test TEXT[][]
+transactions TEXT[][],
+withdrawals TEXT[][]
                             ) SERVER eth_server OPTIONS ( start '1', count '100', url '/home/thomas/eth_fdw/blocks.json' );
 
 
 CREATE MATERIALIZED VIEW eth_view AS SELECT * FROM eth_table;
-SELECT number, test FROM eth_view;
+SELECT number, transactions FROM eth_view;
 
 --REFRESH MATERIALIZED VIEW eth_view;

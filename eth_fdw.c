@@ -17,7 +17,7 @@
 #include <threads.h>
 
 #define THRD_COUNT 64
-#define MAX 32
+#define MAX 3
 
 PG_MODULE_MAGIC; //lets postgres know that this is dynamically loadable (put in ONE source file after fmgr.h)
 PG_FUNCTION_INFO_V1(edw_handler);
@@ -72,6 +72,8 @@ struct data_object {
     int count;
 };
 
+struct data_value data_string_init(char* start, int len);
+
 struct data_object *data_object_init(void);
 void data_object_free(struct data_object* o);
 void data_object_append_entry(struct data_object *o, struct data_entry e);
@@ -80,6 +82,7 @@ struct data_value data_object_get(struct data_object *o, const char* key);
 struct data_list *data_list_init(void);
 void data_list_free(struct data_list* l);
 void data_list_append_value(struct data_list *l, struct data_value v);
+void data_list_insert_value(struct data_list *l, struct data_value v, int idx);
 
 /*
  * Ethereum data wrapper core structs and function declarations
@@ -115,6 +118,10 @@ void edw_ReScanForeignScan(ForeignScanState *node);
 void edw_EndForeignScan(ForeignScanState *node);
 
 void edw_insert_value(TupleTableSlot *slot, int idx, struct data_value v);
+int edw_append_headers(TupleTableSlot *slot, int start_idx, struct data_list *headers);
+int edw_append_transactions(TupleTableSlot *slot, int start_idx, struct data_list *encoded_txns);
+int edw_append_uncles(TupleTableSlot *slot, int start_idx, struct data_list *uncles);
+int edw_append_withdrawals(TupleTableSlot *slot, int start_idx, struct data_list *withdrawals);
 
 /*
  * Json parser structs and function declarations
@@ -152,6 +159,14 @@ int http_send_request(void* args);
 /*
  * Shared primitive data function implementations
  */
+
+struct data_value data_string_init(char* start, int len) {
+    struct data_value v;
+    v.type = DATA_STR;
+    v.as.string.start = start;
+    v.as.string.len = len;
+    return v;
+}
 
 struct data_object *data_object_init(void) {
     struct data_object* o = palloc(sizeof(struct data_object));
@@ -233,6 +248,21 @@ void data_list_append_value(struct data_list *l, struct data_value v) {
         l->values = repalloc(l->values, sizeof(struct data_value) * l->capacity);
     }
     l->values[l->count] = v;
+    l->count++;
+}
+
+void data_list_insert_value(struct data_list *l, struct data_value v, int idx) {
+    if (l->count + 1 > l->capacity) {
+        l->capacity *= 2;
+        l->values = repalloc(l->values, sizeof(struct data_value) * l->capacity);
+    }
+
+    struct data_value *src = &l->values[idx];
+    struct data_value *dst = src + 1;
+    size_t len = (l->count - idx) * sizeof(struct data_value);
+    memmove(dst, src, len);
+
+    l->values[idx] = v;
     l->count++;
 }
 
@@ -405,9 +435,13 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
 void edw_insert_value(TupleTableSlot *slot, int idx, struct data_value v) {
     slot->tts_isnull[idx] = false;
     switch (v.type) {
-        case DATA_INT:
-            slot->tts_values[idx] = Int64GetDatum(v.as.integer);
+        case DATA_INT: {
+            char buf[128];
+            sprintf(buf, "%ld", v.as.integer);
+            slot->tts_values[idx] = CStringGetTextDatum(buf);
+            //slot->tts_values[idx] = Int64GetDatum(v.as.integer); using all TEXT for now just to simplify my life
             break;
+        }
         case DATA_STR: {
             char* buf = palloc(sizeof(char) * (v.as.string.len + 1));
             memcpy(buf, v.as.string.start, v.as.string.len);
@@ -419,6 +453,173 @@ void edw_insert_value(TupleTableSlot *slot, int idx, struct data_value v) {
         default:
             break;
     }
+}
+
+int edw_append_headers(TupleTableSlot *slot, int start_idx, struct data_list *headers) {
+    //block header.  See EIP4895 for details
+   
+    int idx = start_idx;
+    edw_insert_value(slot, idx++, headers->values[0]); //parent_hash
+    edw_insert_value(slot, idx++, headers->values[1]); //ommers_hash
+    edw_insert_value(slot, idx++, headers->values[2]); //coinbase
+    edw_insert_value(slot, idx++, headers->values[3]); //state_root
+    edw_insert_value(slot, idx++, headers->values[4]); //txs_root
+
+    edw_insert_value(slot, idx++, headers->values[5]); //receipts_root
+    edw_insert_value(slot, idx++, headers->values[6]); //logs_bloom
+    edw_insert_value(slot, idx++, headers->values[7]); //difficulty
+    edw_insert_value(slot, idx++, headers->values[8]); //number
+    edw_insert_value(slot, idx++, headers->values[9]); //gas_limit
+
+    edw_insert_value(slot, idx++, headers->values[10]); //gas_used
+    edw_insert_value(slot, idx++, headers->values[11]); //timestamp
+    edw_insert_value(slot, idx++, headers->values[12]); //extradata
+    edw_insert_value(slot, idx++, headers->values[13]); //prev_randao
+    edw_insert_value(slot, idx++, headers->values[14]); //nonce
+
+    edw_insert_value(slot, idx++, headers->values[15]); //base_fee_per_gas
+    edw_insert_value(slot, idx++, headers->values[16]); //withdrawals_root
+
+    return idx;
+}
+
+int edw_append_transactions(TupleTableSlot *slot, int start_idx, struct data_list *encoded_txns) {
+    //transactions (first value is type, and then the following list is transaction information)
+    //see EIP1559 for details
+
+    int idx = start_idx;
+    int ele = 13; //using EIP1559 fields. Types without those fields (0 and 1) will be filled with null
+    Datum *values = palloc(sizeof(Datum) * encoded_txns->count * ele);
+    bool *nulls = palloc(sizeof(bool) * encoded_txns->count * ele);
+    int dims[2];
+    dims[0] = encoded_txns->count;
+    dims[1] = ele;
+    int lbs[2];
+    lbs[0] = 1;
+    lbs[1] = 1;
+
+    for (int i = 0; i < encoded_txns->count; i++) {
+        struct data_value v = encoded_txns->values[i];
+        struct data_list *fields;
+        if (v.type == DATA_LIST) {
+            //type 0 transaction
+            struct data_value type = data_string_init("0", 1);
+            fields = v.as.list;
+            data_list_insert_value(fields, type, 0);
+        } else {
+            //type 1 or 2 transaction - need to decode payload
+            struct data_buf buf;
+            buf.size = v.as.string.len;
+            buf.buf = v.as.string.start;
+            buf.cur = 0;
+            struct data_value type = rlp_parse_value(&buf);
+            fields = rlp_parse_value(&buf).as.list;
+            data_list_insert_value(fields, type, 0);
+        }
+
+
+        /*
+        struct data_value d = fields->values[0];
+        switch (d.type) {
+            case DATA_INT: {
+                char n[128];
+                sprintf(n, "%ld", d.as.integer);
+                values[i * ele] = CStringGetTextDatum(n);
+                break;
+            }
+            case DATA_STR: {
+                char n[128];
+                memcpy(n, d.as.string.start, d.as.string.len);
+                n[d.as.string.len] = '\0';
+                values[i * ele] = CStringGetTextDatum(n);
+                break;
+            }
+             default:
+                break;
+        }
+        nulls[i * ele] = false;*/
+
+        for (int j = 0; j < ele; j++) {
+            if (j >= fields->count) {
+                nulls[i * ele + j] = true;
+                continue;
+            }
+
+            //TODO: This is breaking - a non-string/int is getting decoded
+            struct data_value d = fields->values[j];
+            switch (d.type) {
+                case DATA_INT: {
+                    char n[128];
+                    sprintf(n, "%ld", d.as.integer);
+                    values[i * ele + j] = CStringGetTextDatum(n);
+                    break;
+                }
+                case DATA_STR: {
+                    char *n = palloc(sizeof(char) * (d.as.string.len + 1));
+                    memcpy(n, d.as.string.start, d.as.string.len);
+                    n[d.as.string.len] = '\0';
+                    values[i * ele + j] = CStringGetTextDatum(n);
+                    pfree(n);
+                    break;
+                }
+                case DATA_LIST: {
+                    values[i * ele + j] = CStringGetTextDatum("access list placeholder");
+                    break;
+                }
+                 default:
+        ereport(ERROR,
+                errcode(ERRCODE_FDW_ERROR),
+                errmsg("non int or string found in transaction!"));
+                    break;
+            }
+            //values[i * ele + j] = CStringGetTextDatum("est");
+            nulls[i * ele + j] = false;
+        }
+    }
+
+    slot->tts_isnull[idx] = false;
+    slot->tts_values[idx++] = PointerGetDatum(construct_md_array(values, nulls, 2, dims, lbs, TEXTOID, -1, false, 'i'));
+
+    pfree(values);
+
+    return idx;
+}
+
+int edw_append_uncles(TupleTableSlot *slot, int start_idx, struct data_list *uncles) {
+    return start_idx;
+}
+
+int edw_append_withdrawals(TupleTableSlot *slot, int start_idx, struct data_list *withdrawals) {
+    //withdrawals. See EIP4895 for details
+    
+    int idx = start_idx;
+    int ele = 4; //index, validator_index, address, amount
+    Datum *values = palloc(sizeof(Datum) * withdrawals->count * ele);
+    int dims[2];
+    dims[0] = withdrawals->count;
+    dims[1] = ele;
+    int lbs[2];
+    lbs[0] = 1;
+    lbs[1] = 1;
+
+    for (int i = 0; i < withdrawals->count; i++) {
+        struct data_list *w = withdrawals->values[i].as.list;
+        for (int j = 0; j < ele; j++) {
+            struct data_string s = w->values[j].as.string;
+            char buf[128];
+            memcpy(buf, s.start, s.len);
+            buf[s.len] = '\0';
+            values[i * ele + j] = CStringGetTextDatum(buf);
+        }
+    }
+
+    Datum array = PointerGetDatum(construct_md_array(values, NULL, 2, dims, lbs, TEXTOID, -1, false, 'i'));
+    slot->tts_isnull[idx] = false;
+    slot->tts_values[idx++] = array;
+
+    pfree(values);
+
+    return idx;
 }
 
 TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
@@ -455,76 +656,12 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
             buf.size = s.as.string.len;
             buf.cur = 0;
             struct data_list *decoded_result = rlp_decode_raw_buf(&buf).as.list;
-            struct data_list *header = decoded_result->values[0].as.list;
-            //[1] transactions
-            //[2] uncles
-            struct data_list *withdrawals = decoded_result->values[3].as.list;
 
-            //block header.  See EIP4895 for details
-            edw_insert_value(slot, 0, header->values[0]); //parent_hash
-            edw_insert_value(slot, 1, header->values[1]); //ommers_hash
-            edw_insert_value(slot, 2, header->values[2]); //coinbase
-            edw_insert_value(slot, 3, header->values[3]); //state_root
-            edw_insert_value(slot, 4, header->values[4]); //txs_root
-
-            edw_insert_value(slot, 5, header->values[5]); //receipts_root
-            edw_insert_value(slot, 6, header->values[6]); //logs_bloom
-            edw_insert_value(slot, 7, header->values[7]); //difficulty
-            edw_insert_value(slot, 8, header->values[8]); //number
-            edw_insert_value(slot, 9, header->values[9]); //gas_limit
-
-            edw_insert_value(slot, 10, header->values[10]); //gas_used
-            edw_insert_value(slot, 11, header->values[11]); //timestamp
-            edw_insert_value(slot, 12, header->values[12]); //extradata
-            edw_insert_value(slot, 13, header->values[13]); //prev_randao
-            edw_insert_value(slot, 14, header->values[14]); //nonce
-
-            edw_insert_value(slot, 15, header->values[15]); //base_fee_per_gas
-            edw_insert_value(slot, 16, header->values[16]); //withdrawals_root
-
-
-            //withdrawals. See EIP4895 for details
-            int ele = 4; //index, validator_index, address, amount
-            Datum *values = palloc(sizeof(Datum) * withdrawals->count * ele);
-            int dims[2];
-            dims[0] = withdrawals->count;
-            dims[1] = ele;
-            int lbs[2];
-            lbs[0] = 1;
-            lbs[1] = 1;
-
-            for (int i = 0; i < withdrawals->count; i++) {
-                struct data_list *w = withdrawals->values[i].as.list;
-                for (int j = 0; j < ele; j++) {
-                    struct data_string s = w->values[j].as.string;
-                    char buf[128];
-                    memcpy(buf, s.start, s.len);
-                    buf[s.len] = '\0';
-                    values[i * ele + j] = CStringGetTextDatum(buf);
-                }
-            }
-
-            Datum array = PointerGetDatum(construct_md_array(values, NULL, 2, dims, lbs, TEXTOID, -1, false, 'i'));
-            slot->tts_isnull[17] = false;
-            slot->tts_values[17] = array;
-
-            pfree(values);
-
-            //transactions (first value is type, and then the following list is transaction information)
-            //see EIP1559 for details
-
-            /*
-            Datum values[3];
-            values[0] = CStringGetTextDatum("test 1");
-            values[1] = CStringGetTextDatum("test 2");
-            values[2] = CStringGetTextDatum("test 3");
-            int dims = 3;
-            int lbs = 1; //sql starts with index 1
-            Datum array = PointerGetDatum(construct_md_array(values, NULL, 1, &dims, &lbs, TEXTOID, -1, false, 'i'));
-
-            slot->tts_isnull[17] = false;
-            slot->tts_values[17] = array;
-            */
+            int idx = 0;
+            idx = edw_append_headers(slot, idx, decoded_result->values[0].as.list);
+            idx = edw_append_transactions(slot, idx, decoded_result->values[1].as.list);
+            idx = edw_append_uncles(slot, idx, decoded_result->values[2].as.list);
+            idx = edw_append_withdrawals(slot, idx, decoded_result->values[3].as.list);
 
             ExecStoreVirtualTuple(slot);
             data_object_free(obj);
@@ -800,28 +937,34 @@ size_t http_write_callback(void *ptr, size_t size, size_t nmemb, void *userdata)
 
 
 int http_send_request(void* args) {
-    int i = *((int*)args);
-    struct edw_state* state = *((struct edw_state**)((uint8_t*)(args) + sizeof(int)));
-    int id = i % THRD_COUNT;
-
     CURL *curl;
-    curl = curl_easy_init();
     CURLcode res;
-    struct curl_slist *list = NULL;
-
+    struct curl_slist *list;
+    struct edw_state *state;
+    int i, id;
     char uri[128];
+    char data[128];
+    size_t len;
+    long http_code;
+    const char *header = "Content-Type: application/json";
+
+    i = *((int*)args);
+    state = *((struct edw_state**)((uint8_t*)(args) + sizeof(int)));
+    id = i % THRD_COUNT;
+
+    curl = curl_easy_init();
+    list = NULL;
+
     sprintf(uri, "https://ethereum-mainnet-archive.allthatnode.com/%s", state->key_buf);
     //sprintf(uri, "https://mainnet.infura.io/v3/%s", state->key_buf);
-    const char *header = "Content-Type: application/json";
     
     curl_easy_setopt(curl, CURLOPT_URL, uri);
     list = curl_slist_append(list, header);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
 
-    char data[128];
     sprintf(data, "{ \"jsonrpc\":\"2.0\", \"method\":\"debug_getRawBlock\",\"params\":[\"0x110fec6\"],\"id\":%d}", i);
-    size_t len = strlen(data);
+    len = strlen(data);
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
     curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, data);
@@ -833,7 +976,7 @@ int http_send_request(void* args) {
     curl_easy_setopt(curl, CURLOPT_URL, uri);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
-    long http_code = 0;
+    http_code = 0;
     state->bufs[id].buf = NULL;
     do {
         //initialize buffer to null/free in case curl_easy_perform is called multiple times
