@@ -17,7 +17,6 @@
 #include <threads.h>
 
 #define THRD_COUNT 64
-#define MAX 64
 
 PG_MODULE_MAGIC; //lets postgres know that this is dynamically loadable (put in ONE source file after fmgr.h)
 PG_FUNCTION_INFO_V1(edw_handler);
@@ -89,16 +88,20 @@ void data_list_insert_value(struct data_list *l, struct data_value v, int idx);
  */
 
 struct edw_state {
+    //TODO: will not need this soon
     char* key_buf;
     size_t key_len;
 
-    char* buf;
-    size_t len;
-
-    int cur; //???? Think of more descriptive field name - I don't remember what this is for
-    int count; //???? Think of more descriptive field name - don't remember
+    int current_count;
+    int total_count;
+    char *provider;
 
     struct data_buf bufs[THRD_COUNT];
+};
+
+struct edw_options {
+    int count;
+    char* provider;
 };
 
 Datum edw_handler(PG_FUNCTION_ARGS);
@@ -289,18 +292,16 @@ Datum edw_validator(PG_FUNCTION_ARGS) {
     List *options_list;
     ListCell *cell;
     
-    
     options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 
     foreach(cell, options_list) {
         DefElem *def = lfirst_node(DefElem, cell);
 
-        if (!(strcmp("count", def->defname) == 0 ||
-              strcmp("provider", def->defname) == 0)) {
+        if (!(strcmp("block_count", def->defname) == 0 || strcmp("provider", def->defname) == 0)) {
             ereport(ERROR,
                     errcode(ERRCODE_FDW_ERROR),
                     errmsg("\"%s\" is not a valid option", def->defname),
-                    errhint("Valid table options for edw are \"count\" and \"provider\""));
+                    errhint("Valid table options for edw are \"block_count\" and \"provider\""));
         }
     }
 
@@ -332,13 +333,39 @@ void edw_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreignta
 
     table_close(rel, NoLock);*/
 
-    //ForeignTable *ft = GetForeignTable(foreigntableid);
-    //eth_fdw_apply_data_options(state, ft);
+    int count = 128;
+    char *provider = NULL;
+    ForeignTable *ft = GetForeignTable(foreigntableid);
+    ListCell *cell;
 
+    foreach(cell, ft->options) {
+        DefElem *def = lfirst_node(DefElem, cell);
 
-    //make private struct for fdw, and pass to baserel
-    //read options values (should have been validated in validator by now)
-    //set baserel->rows (this is used to estimate best path????)
+        if (strcmp(def->defname, "block_count") == 0) {
+            char *val = defGetString(def);
+            if (sscanf(val, "%d", &count) != 1) {
+                //error - argument must be integer typ
+            }
+        } else if (strcmp(def->defname, "provider") == 0) {
+            char *val = defGetString(def);
+            int len = strlen(val);
+            provider = palloc(sizeof(char) * (len + 1));
+            memcpy(provider, val, len);
+            provider[len] = '\0';
+        } else {
+            //report error - unknown option
+        }
+    }
+
+    if (!provider) {
+        //error - provider must be provided
+    }
+
+    baserel->rows = count;
+    struct edw_options *opts = palloc(sizeof(struct edw_options));
+    opts->count = count;
+    opts->provider = provider;
+    baserel->fdw_private = opts;
 }
 
 void edw_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
@@ -362,26 +389,28 @@ ForeignScan *edw_GetForeignPlan(PlannerInfo *root,
                                          List *scan_clauses, 
                                          Plan *outer_plan) {
 
-    //get private struct from baserel
-    //pass those options to make_foreignscan function (may need to extend node or make data into nodes)
+    struct edw_options *opts = baserel->fdw_private;
+    List *fdw_private = list_make2(makeInteger(opts->count), makeString(opts->provider));
     scan_clauses = extract_actual_clauses(scan_clauses, false);
     return make_foreignscan(tlist,
             scan_clauses,
             baserel->relid,
             NIL,
-            NIL,
+            fdw_private,
             NIL,
             NIL,
             outer_plan);
 }
 
 void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
+    ForeignScan *fs = (ForeignScan*)node->ss.ps.plan;
     struct edw_state *state;
     long bufsize;
     FILE* f;
     state = palloc(sizeof(struct edw_state));
-    state->cur = 0;
-    state->len = 10;
+    state->current_count = 0;
+    state->total_count = intVal(linitial(fs->fdw_private));
+    state->provider = strVal(lsecond(fs->fdw_private));
 
     const char* path = "/home/thomas/eth_fdw/allthatnode.key";
     //const char* path = "/home/thomas/eth_fdw/infura.key";
@@ -412,7 +441,7 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
 
     state->key_buf = palloc(sizeof(char) * (bufsize + 1));
     state->key_len = fread(state->key_buf, sizeof(char), bufsize, f);
-    state->cur = 0;
+    //state->cur = 0;
 
     if (ferror(f) != 0) {
         ereport(ERROR,
@@ -426,7 +455,7 @@ void edw_BeginForeignScan(ForeignScanState *node, int eflags) {
 
     curl_global_init(CURL_GLOBAL_ALL);
 
-    state->count = 0;
+    state->current_count = 0;
 
     node->fdw_state = state;
 }
@@ -629,14 +658,14 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
     ExecClearTuple(slot);
     state = node->fdw_state;
 
-    if (state->count < MAX) {
+    if (state->current_count < state->total_count) {
         //batch http requests by THRD_COUNT
-        if (state->count % THRD_COUNT == 0) {
+        if (state->current_count % THRD_COUNT == 0) {
             thrd_t threads[THRD_COUNT];
             uint8_t thrd_data[THRD_COUNT][sizeof(int) + sizeof(struct edw_state**)];
 
             for (int i = 0; i < THRD_COUNT; i++) {
-                *((int*)(thrd_data[i])) = (state->count / THRD_COUNT) * THRD_COUNT + i;
+                *((int*)(thrd_data[i])) = (state->current_count / THRD_COUNT) * THRD_COUNT + i;
                 *((struct edw_state**)(thrd_data[i] + sizeof(int))) = state;
                 thrd_create(&threads[i], &http_send_request, thrd_data[i]);
             }
@@ -646,8 +675,8 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
             }
         }
 
-        if (state->count < MAX) {
-            struct data_object *obj = json_parse_object(&state->bufs[state->count % THRD_COUNT]);
+        if (state->current_count < state->total_count) {
+            struct data_object *obj = json_parse_object(&state->bufs[state->current_count % THRD_COUNT]);
             struct data_value s = data_object_get(obj, "result");
 
             struct data_buf buf;
@@ -664,18 +693,18 @@ TupleTableSlot *edw_IterateForeignScan(ForeignScanState *node) {
 
             ExecStoreVirtualTuple(slot);
             data_object_free(obj);
-            free(state->bufs[state->count % THRD_COUNT].buf);
+            free(state->bufs[state->current_count % THRD_COUNT].buf);
         }
     }
 
-    state->count++;
+    state->current_count++;
 
     return slot;
 }
 
 void edw_ReScanForeignScan(ForeignScanState *node) {
     struct edw_state *state = node->fdw_state;
-    state->cur = 0;
+    state->current_count = 0;
 }
 
 void edw_EndForeignScan(ForeignScanState *node) {
@@ -941,7 +970,6 @@ int http_send_request(void* args) {
     struct curl_slist *list;
     struct edw_state *state;
     int off, id;
-    char uri[128];
     char data[128];
     size_t len;
     long http_code;
@@ -954,10 +982,7 @@ int http_send_request(void* args) {
     curl = curl_easy_init();
     list = NULL;
 
-    sprintf(uri, "https://ethereum-mainnet-archive.allthatnode.com/%s", state->key_buf);
-    //sprintf(uri, "https://mainnet.infura.io/v3/%s", state->key_buf);
-    
-    curl_easy_setopt(curl, CURLOPT_URL, uri);
+    curl_easy_setopt(curl, CURLOPT_URL, state->provider);
     list = curl_slist_append(list, header);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
@@ -977,7 +1002,6 @@ int http_send_request(void* args) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state->bufs[id]);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
 
-    curl_easy_setopt(curl, CURLOPT_URL, uri);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
     http_code = 0;
