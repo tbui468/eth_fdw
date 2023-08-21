@@ -4,3 +4,5 @@
 /eth_fdw.so
 /allthatnode.key
 /infura.key
+/smoke_test.sql
+

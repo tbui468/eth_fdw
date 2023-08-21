@@ -296,12 +296,11 @@ Datum edw_validator(PG_FUNCTION_ARGS) {
         DefElem *def = lfirst_node(DefElem, cell);
 
         if (!(strcmp("count", def->defname) == 0 ||
-              strcmp("url", def->defname) == 0 ||
-              strcmp("start", def->defname) == 0)) {
+              strcmp("provider", def->defname) == 0)) {
             ereport(ERROR,
                     errcode(ERRCODE_FDW_ERROR),
                     errmsg("\"%s\" is not a valid option", def->defname),
-                    errhint("Valid table options for edw are \"start\", \"count\" and \"url\""));
+                    errhint("Valid table options for edw are \"count\" and \"provider\""));
         }
     }
 
